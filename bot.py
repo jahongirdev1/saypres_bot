@@ -566,7 +566,7 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
 # ---------------------------
 #  Main message handler
 # ---------------------------
-@dp.message_handler(content_types=['text', 'photo', 'voice'])
+@dp.message_handler(content_types=['text', 'photo', 'voice', 'document'])
 async def handle_message(message: types.Message):
     logger.info(f"Received message from user {message.from_user.id}: {message.text}")
     if message.chat.type in ["group", "supergroup"]:
@@ -594,6 +594,34 @@ async def handle_message(message: types.Message):
         kb.add("Back")
         await message.answer("Time-Off request canceled. You are in Safety category:", reply_markup=kb)
         user_selected_category[user_id] = "Safety"
+        return
+
+    # --- Обработка кнопки "Back" в режиме ввода собственного вопроса ---
+    if text == "Back" and current_state == STATE_AWAITING_CONTENT:
+        user_state[user_id] = STATE_NONE
+        current_category = user_selected_category.get(user_id)
+        if current_category:
+            teleuser = await get_teleuser_by_id(user_id)
+            company_id = teleuser.company_id if teleuser else None
+            questions = await get_questions_for_category_async(current_category, company_id=company_id)
+            kb = ReplyKeyboardMarkup(resize_keyboard=True)
+            for q in questions:
+                kb.add(q.question)
+            kb.add("Ask your questions")
+            if current_category == "Safety":
+                kb.add("Request Time Off")
+            kb.add("Back")
+            await message.answer(f"You returned to category: {current_category}", reply_markup=kb)
+        else:
+            kb = ReplyKeyboardMarkup(resize_keyboard=True)
+            teleuser = await get_teleuser_by_id(user_id)
+            if not teleuser:
+                kb.add("Register")
+            else:
+                cats = await get_categories_async(company_id=teleuser.company_id)
+                for c in cats:
+                    kb.add(c.name)
+            await message.answer("You have returned to the list of categories.", reply_markup=kb)
         return
 
     # --- Обработка кнопки "Back" для категорий ---
@@ -678,7 +706,11 @@ async def handle_message(message: types.Message):
             return
 
         content_text = text or ""
-        content_photo = message.photo[-1].file_id if message.photo else ""
+        content_photo = ""
+        if message.document and getattr(message.document, "mime_type", None) and message.document.mime_type.startswith("image/"):
+            content_photo = message.document.file_id
+        elif message.photo:
+            content_photo = message.photo[-1].file_id
         content_voice = message.voice.file_id if message.voice else ""
 
         if content_text or content_photo or content_voice:
@@ -895,7 +927,12 @@ async def handle_message(message: types.Message):
             return
         if text == "Ask your questions":
             user_state[user_id] = STATE_AWAITING_CONTENT
-            await message.answer("Send text, photo, or voice message (or any combination):", reply_markup=ReplyKeyboardRemove())
+            kb = ReplyKeyboardMarkup(resize_keyboard=True)
+            kb.add("Back")
+            await message.answer(
+                "Send text, photo, or voice message.\nPress 'Back' if you changed your mind.",
+                reply_markup=kb
+            )
             return
         await message.answer("I did not understand your choice. Please select a ready question, click 'Ask your questions', or 'Back'.")
         return
