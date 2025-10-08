@@ -66,4 +66,4 @@ class MessageLogAdmin(admin.ModelAdmin):
 @admin.register(TopicMap)
 class TopicMapAdmin(admin.ModelAdmin):
     list_display = ('teleuser', 'category', 'topic_id', 'created_at')
-    search_fields = ('teleuser__first_name', 'teleuser__nickname', 'teleuser__telegram_id', 'category')
+    search_fields = ('teleuser__first_name', 'teleuser__nickname', 'teleuser__telegram_id', 'category__name')
