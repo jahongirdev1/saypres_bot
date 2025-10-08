@@ -19,7 +19,16 @@ from aiogram.types import (
     InputTextMessageContent,
 )
 
-from main.models import Category, Question, UserQuestion, TeleUser, Company, TimeOff, MessageLog
+from main.models import (
+    Category,
+    Question,
+    UserQuestion,
+    TeleUser,
+    Company,
+    TimeOff,
+    MessageLog,
+    TopicMap,
+)
 from datetime import datetime, date
 import calendar
 
@@ -154,21 +163,53 @@ def update_category_topic_id_async(category_id: int, topic_id: int):
 
 
 @sync_to_async
-def create_message_log_entry_async(teleuser: TeleUser, company: Company, category: Optional[Category],
-                                   from_group_id: Optional[int], to_group_id: int, topic_id: Optional[int],
-                                   content_text: Optional[str], content_photo: Optional[str],
-                                   content_voice: Optional[str]):
+def create_message_log_entry_async(
+    teleuser: TeleUser,
+    company: Optional[Company],
+    category: Optional[Category],
+    from_group_id: Optional[int],
+    to_group_id: Optional[int],
+    topic_id: Optional[int],
+    content_text: Optional[str],
+    content_photo: Optional[str],
+    content_voice: Optional[str],
+    *,
+    driver_group_id: Optional[int] = None,
+    manager_group_id: Optional[int] = None,
+    category_name: Optional[str] = None,
+):
     return MessageLog.objects.create(
         teleuser=teleuser,
         company=company,
         category=category,
-        from_group_id=int(from_group_id) if from_group_id is not None else 0,
-        to_group_id=int(to_group_id),
+        category_name=category_name or (category.name if category else None),
+        from_group_id=int(from_group_id) if from_group_id is not None else None,
+        to_group_id=int(to_group_id) if to_group_id is not None else None,
         topic_id=topic_id,
         content_text=content_text or "",
         content_photo=content_photo,
-        content_voice=content_voice
+        content_voice=content_voice,
+        driver_group_id=int(driver_group_id) if driver_group_id is not None else None,
+        manager_group_id=int(manager_group_id) if manager_group_id is not None else None,
     )
+
+
+@sync_to_async
+def get_topic_map_async(teleuser_id: int, category_name: str):
+    return TopicMap.objects.filter(teleuser_id=teleuser_id, category=category_name).first()
+
+
+@sync_to_async
+def create_topic_map_async(teleuser: TeleUser, category_name: str, topic_id: int):
+    try:
+        return TopicMap.objects.create(
+            teleuser=teleuser,
+            category=category_name,
+            topic_id=topic_id,
+        )
+    except Exception as exc:
+        logger.error("Failed to create topic map for %s (%s): %s", teleuser.id, category_name, exc)
+        return None
 
 
 async def ensure_category_topic(category: Category, company: Company) -> Optional[int]:
@@ -202,6 +243,94 @@ async def download_file_as_base64(file_id: str) -> Optional[str]:
     except Exception as exc:
         logger.error("Failed to download media %s: %s", file_id, exc)
         return None
+
+
+async def send_to_manager_topic(
+    teleuser: TeleUser,
+    category_name: str,
+    content_text: Optional[str],
+    content_photo: Optional[str],
+    content_voice: Optional[str],
+    message: types.Message,
+    *,
+    category: Optional[Category] = None,
+    is_call_request: bool = False,
+):
+    manager_group_id = teleuser.manager_group_id
+    if not manager_group_id:
+        await message.answer("Manager group is not configured. Please contact an administrator.")
+        return None
+
+    topic_record = await get_topic_map_async(teleuser.id, category_name)
+    if topic_record:
+        topic_id = topic_record.topic_id
+    else:
+        try:
+            new_topic = await bot.create_forum_topic(int(manager_group_id), name=category_name)
+        except Exception as exc:
+            logger.error("Failed to create forum topic for user %s (%s): %s", teleuser.id, category_name, exc)
+            await message.answer("❌ Failed to deliver your message to managers.")
+            return None
+        topic_id = new_topic.message_thread_id
+        await create_topic_map_async(teleuser, category_name, topic_id)
+
+    user_display_parts = []
+    if teleuser.first_name:
+        user_display_parts.append(teleuser.first_name)
+    if teleuser.nickname:
+        user_display_parts.append(f"({teleuser.nickname})")
+    user_display = " ".join(user_display_parts).strip() or "Driver"
+    username = message.from_user.username
+    mention = f"@{username}" if username else str(teleuser.telegram_id)
+
+    summary_lines = [
+        f"Message from {user_display} - {mention}",
+        f"Category: {category_name}",
+        f"Type: {'Call request' if is_call_request else 'Message'}",
+        "",
+    ]
+    if content_text:
+        summary_lines.append(f"Text: {content_text}")
+    if content_photo:
+        summary_lines.append("Photo attached")
+    if content_voice:
+        summary_lines.append("Voice message attached")
+
+    summary = "\n".join(summary_lines).strip()
+
+    try:
+        await bot.send_message(int(manager_group_id), summary, message_thread_id=topic_id)
+        await bot.copy_message(
+            chat_id=int(manager_group_id),
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            message_thread_id=topic_id,
+        )
+    except Exception as exc:
+        logger.error("Failed to send message to manager group %s: %s", manager_group_id, exc)
+        await message.answer("❌ Failed to deliver your message to managers.")
+        return None
+
+    photo_b64 = await download_file_as_base64(content_photo) if content_photo else None
+    voice_b64 = await download_file_as_base64(content_voice) if content_voice else None
+    from_group = teleuser.driver_group_id if teleuser.driver_group_id is not None else message.chat.id
+
+    await create_message_log_entry_async(
+        teleuser=teleuser,
+        company=teleuser.company,
+        category=category,
+        from_group_id=from_group,
+        to_group_id=int(manager_group_id),
+        topic_id=topic_id,
+        content_text=content_text or "",
+        content_photo=photo_b64,
+        content_voice=voice_b64,
+        driver_group_id=teleuser.driver_group_id,
+        manager_group_id=teleuser.manager_group_id,
+        category_name=category_name,
+    )
+
+    return topic_id
 
 # ---------------------------
 #  Group messages handler
@@ -424,82 +553,30 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
     else:
         category = await get_or_create_category_for_company_async(company.id, DEFAULT_GENERAL_CATEGORY_NAME)
 
-    manager_group_id = company.manager_group_id
-    if not manager_group_id:
-        await message.answer("Manager group is not configured. Please contact an administrator.")
-        return
-
-    topic_id = await ensure_category_topic(category, company)
+    category_name = category.name if category else DEFAULT_GENERAL_CATEGORY_NAME
+    topic_id = await send_to_manager_topic(
+        teleuser=teleuser,
+        category_name=category_name,
+        content_text=content_text,
+        content_photo=content_photo,
+        content_voice=content_voice,
+        message=message,
+        category=category,
+        is_call_request=is_call_me,
+    )
     if topic_id is None:
-        await message.answer("Failed to access the discussion topic for this category.")
         return
-
-    display_name_parts = []
-    if teleuser.first_name:
-        display_name_parts.append(teleuser.first_name)
-    if teleuser.nickname:
-        display_name_parts.append(f"({teleuser.nickname})")
-    display_name = " ".join(display_name_parts).strip() or str(user_id)
-    if message.from_user.username:
-        display_name = f"{display_name} - @{message.from_user.username}"
-
-    summary_lines = [
-        f"📨 Message from {display_name}",
-        f"Category: {category.name}",
-        f"Type: {'Call request' if is_call_me else 'Message'}"
-    ]
-    if content_text:
-        summary_lines.append(f"Text: {content_text}")
-    if content_photo:
-        summary_lines.append("Photo attached below.")
-    if content_voice:
-        summary_lines.append("Voice message attached below.")
-
-    summary_text = "\n".join(summary_lines)
-
-    try:
-        await bot.send_message(
-            int(manager_group_id),
-            summary_text,
-            message_thread_id=topic_id
-        )
-        await bot.copy_message(
-            chat_id=int(manager_group_id),
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-            message_thread_id=topic_id
-        )
-    except Exception as exc:
-        logger.error("Failed to forward message to managers: %s", exc)
-        await message.answer("Failed to forward your message. Please try again later.")
-        return
-
-    photo_b64 = await download_file_as_base64(content_photo) if content_photo else None
-    voice_b64 = await download_file_as_base64(content_voice) if content_voice else None
 
     await save_user_question_async(
         user_id,
         message.from_user.username or "",
-        category.name,
+        category_name,
         content_text or "",
         content_photo or "",
         content_voice or "",
         company_id=company.id,
-        responsible_id=str(manager_group_id),
+        responsible_id=str(teleuser.manager_group_id),
         mention_id=str(topic_id)
-    )
-
-    from_group = company.driver_group_id if company.driver_group_id is not None else message.chat.id
-    await create_message_log_entry_async(
-        teleuser=teleuser,
-        company=company,
-        category=category,
-        from_group_id=from_group,
-        to_group_id=int(manager_group_id),
-        topic_id=topic_id,
-        content_text=content_text or "",
-        content_photo=photo_b64,
-        content_voice=voice_b64
     )
 
     action = "call request" if is_call_me else "message"

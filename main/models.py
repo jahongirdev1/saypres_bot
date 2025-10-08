@@ -17,9 +17,31 @@ class TeleUser(models.Model):
     nickname = models.CharField(max_length=100, blank=True, null=True)
     truck_number = models.CharField(max_length=100, blank=True, null=True)
     company = models.ForeignKey(Company, null=True, blank=True, on_delete=models.SET_NULL)
+    driver_group_id = models.BigIntegerField(
+        null=True,
+        blank=True,
+        help_text="Group where driver participates"
+    )
+    manager_group_id = models.BigIntegerField(
+        null=True,
+        blank=True,
+        help_text="Group where only managers participate"
+    )
 
     def __str__(self):
-        return f"{self.first_name} ({self.nickname})"
+        name = self.first_name or "Driver"
+        nickname_part = f" ({self.nickname})" if self.nickname else ""
+        return f"{name}{nickname_part} ({self.telegram_id})"
+
+
+class TopicMap(models.Model):
+    teleuser = models.ForeignKey(TeleUser, on_delete=models.CASCADE)
+    category = models.CharField(max_length=100)
+    topic_id = models.BigIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('teleuser', 'category')
 
 
 class TimeOff(models.Model):
@@ -93,10 +115,13 @@ class BotConfig(models.Model):
 
 class MessageLog(models.Model):
     teleuser = models.ForeignKey(TeleUser, on_delete=models.CASCADE)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE)
-    category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True)
-    from_group_id = models.BigIntegerField()
-    to_group_id = models.BigIntegerField()
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, null=True, blank=True)
+    category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True, blank=True)
+    category_name = models.CharField(max_length=200, blank=True, null=True)
+    from_group_id = models.BigIntegerField(null=True, blank=True)
+    to_group_id = models.BigIntegerField(null=True, blank=True)
+    driver_group_id = models.BigIntegerField(null=True, blank=True)
+    manager_group_id = models.BigIntegerField(null=True, blank=True)
     topic_id = models.BigIntegerField(null=True, blank=True)
     content_text = models.TextField(blank=True, null=True)
     content_photo = models.TextField(blank=True, null=True)

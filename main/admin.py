@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Company, TeleUser, TimeOff, Category, Question, UserQuestion, BotConfig, MessageLog
+from .models import Company, TeleUser, TimeOff, Category, Question, UserQuestion, BotConfig, MessageLog, TopicMap
 
 admin.site.site_header = "Sayram Express LLC"
 admin.site.site_title = "Sayram Express LLC Admin Page"
@@ -12,7 +12,15 @@ class CompanyAdmin(admin.ModelAdmin):
 
 @admin.register(TeleUser)
 class TeleUserAdmin(admin.ModelAdmin):
-    list_display = ('first_name', 'nickname', 'truck_number', 'company', 'telegram_id')
+    list_display = (
+        'first_name',
+        'nickname',
+        'truck_number',
+        'company',
+        'telegram_id',
+        'driver_group_id',
+        'manager_group_id',
+    )
 
 
 @admin.register(TimeOff)
@@ -42,6 +50,20 @@ class BotConfigAdmin(admin.ModelAdmin):
 
 @admin.register(MessageLog)
 class MessageLogAdmin(admin.ModelAdmin):
-    list_display = ('teleuser', 'company', 'category', 'topic_id', 'sent_at')
-    list_filter = ('company', 'category')
+    list_display = (
+        'teleuser',
+        'company',
+        'category',
+        'category_name',
+        'topic_id',
+        'manager_group_id',
+        'sent_at',
+    )
+    list_filter = ('company', 'category', 'manager_group_id')
     search_fields = ('teleuser__first_name', 'teleuser__nickname', 'teleuser__telegram_id')
+
+
+@admin.register(TopicMap)
+class TopicMapAdmin(admin.ModelAdmin):
+    list_display = ('teleuser', 'category', 'topic_id', 'created_at')
+    search_fields = ('teleuser__first_name', 'teleuser__nickname', 'teleuser__telegram_id', 'category')
