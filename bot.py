@@ -8,6 +8,7 @@ django.setup()
 import logging
 import base64
 from typing import Optional
+from django.db.models import Q
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import (
     ReplyKeyboardMarkup,
@@ -108,14 +109,14 @@ def create_timeoff(teleuser_id, date_from, date_till, reason, pause):
 def get_categories_async(company_id=None):
     qs = Category.objects.all()
     if company_id:
-        qs = qs.filter(company_id=company_id)
+        qs = qs.filter(Q(company_id=company_id) | Q(company__isnull=True))
     return list(qs)
 
 @sync_to_async
 def get_questions_for_category_async(category_name: str, company_id=None):
     qs = Category.objects.all()
     if company_id:
-        qs = qs.filter(company_id=company_id)
+        qs = qs.filter(Q(company_id=company_id) | Q(company__isnull=True))
     try:
         cat = qs.get(name=category_name)
     except Category.DoesNotExist:
@@ -126,7 +127,7 @@ def get_questions_for_category_async(category_name: str, company_id=None):
 def save_user_question_async(user_id, username, category_name, content_text, content_photo, content_voice, company_id=None, responsible_id=None, mention_id=None):
     qs = Category.objects.all()
     if company_id:
-        qs = qs.filter(company_id=company_id)
+        qs = qs.filter(Q(company_id=company_id) | Q(company__isnull=True))
     try:
         cat = qs.get(name=category_name)
     except Category.DoesNotExist:
@@ -144,22 +145,33 @@ def save_user_question_async(user_id, username, category_name, content_text, con
 
 @sync_to_async
 def get_category_for_company_async(category_name: Optional[str], company_id: Optional[int]):
-    if not category_name or not company_id:
+    if not category_name:
         return None
-    return Category.objects.filter(name=category_name, company_id=company_id).first()
+    qs = Category.objects.filter(name=category_name)
+    if company_id:
+        qs = qs.filter(Q(company_id=company_id) | Q(company__isnull=True))
+    return qs.first()
 
 
 @sync_to_async
 def get_or_create_category_for_company_async(company_id: Optional[int], category_name: str):
-    if not company_id:
+    if not category_name:
         return None
-    category, _ = Category.objects.get_or_create(name=category_name, company_id=company_id)
+    filters = {"name": category_name}
+    qs = Category.objects.filter(**filters)
+    if company_id:
+        qs = qs.filter(Q(company_id=company_id) | Q(company__isnull=True))
+    category = qs.first()
+    if category:
+        return category
+    defaults = {}
+    if company_id:
+        defaults["company_id"] = company_id
+    category, _ = Category.objects.get_or_create(name=category_name, defaults=defaults)
+    if company_id and category.company_id != company_id:
+        category.company_id = company_id
+        category.save(update_fields=["company"])
     return category
-
-
-@sync_to_async
-def update_category_topic_id_async(category_id: int, topic_id: int):
-    Category.objects.filter(id=category_id).update(responsible_topic_id=str(topic_id))
 
 
 @sync_to_async
@@ -195,40 +207,21 @@ def create_message_log_entry_async(
 
 
 @sync_to_async
-def get_topic_map_async(teleuser_id: int, category_name: str):
-    return TopicMap.objects.filter(teleuser_id=teleuser_id, category=category_name).first()
+def get_topic_map_async(teleuser_id: int, category_id: int):
+    return TopicMap.objects.filter(teleuser_id=teleuser_id, category_id=category_id).first()
 
 
 @sync_to_async
-def create_topic_map_async(teleuser: TeleUser, category_name: str, topic_id: int):
+def create_topic_map_async(teleuser: TeleUser, category: Category, topic_id: int):
     try:
         return TopicMap.objects.create(
             teleuser=teleuser,
-            category=category_name,
+            category=category,
             topic_id=topic_id,
         )
     except Exception as exc:
-        logger.error("Failed to create topic map for %s (%s): %s", teleuser.id, category_name, exc)
+        logger.error("Failed to create topic map for %s (%s): %s", teleuser.id, category.name, exc)
         return None
-
-
-async def ensure_category_topic(category: Category, company: Company) -> Optional[int]:
-    if not category or not company or not company.manager_group_id:
-        return None
-    if category.responsible_topic_id:
-        try:
-            return int(category.responsible_topic_id)
-        except (TypeError, ValueError):
-            logger.warning("Invalid topic id stored for category %s: %s", category.id, category.responsible_topic_id)
-    try:
-        forum_topic = await bot.create_forum_topic(int(company.manager_group_id), name=category.name)
-    except Exception as exc:
-        logger.error("Failed to create forum topic for category %s: %s", category.id, exc)
-        return None
-    thread_id = forum_topic.message_thread_id
-    await update_category_topic_id_async(category.id, thread_id)
-    category.responsible_topic_id = str(thread_id)
-    return thread_id
 
 
 async def download_file_as_base64(file_id: str) -> Optional[str]:
@@ -252,51 +245,34 @@ async def send_to_manager_topic(
     content_photo: Optional[str],
     content_voice: Optional[str],
     message: types.Message,
-    *,
-    category: Optional[Category] = None,
-    is_call_request: bool = False,
 ):
     manager_group_id = teleuser.manager_group_id
     if not manager_group_id:
-        await message.answer("Manager group is not configured. Please contact an administrator.")
+        await message.answer("❌ Failed to deliver your message to managers.")
+        logger.error("Manager group is not configured for teleuser %s", teleuser.id)
         return None
 
-    topic_record = await get_topic_map_async(teleuser.id, category_name)
+    try:
+        category = await sync_to_async(Category.objects.get)(name=category_name)
+    except Category.DoesNotExist:
+        category = await sync_to_async(Category.objects.create)(name=category_name)
+
+    topic_record = await get_topic_map_async(teleuser.id, category.id)
     if topic_record:
         topic_id = topic_record.topic_id
     else:
         try:
-            new_topic = await bot.create_forum_topic(int(manager_group_id), name=category_name)
+            new_topic = await bot.create_forum_topic(int(manager_group_id), name=category.name)
         except Exception as exc:
-            logger.error("Failed to create forum topic for user %s (%s): %s", teleuser.id, category_name, exc)
+            logger.error("Failed to create forum topic for user %s (%s): %s", teleuser.id, category.name, exc)
             await message.answer("❌ Failed to deliver your message to managers.")
             return None
         topic_id = new_topic.message_thread_id
-        await create_topic_map_async(teleuser, category_name, topic_id)
+        await create_topic_map_async(teleuser, category, topic_id)
 
-    user_display_parts = []
-    if teleuser.first_name:
-        user_display_parts.append(teleuser.first_name)
-    if teleuser.nickname:
-        user_display_parts.append(f"({teleuser.nickname})")
-    user_display = " ".join(user_display_parts).strip() or "Driver"
-    username = message.from_user.username
-    mention = f"@{username}" if username else str(teleuser.telegram_id)
-
-    summary_lines = [
-        f"Message from {user_display} - {mention}",
-        f"Category: {category_name}",
-        f"Type: {'Call request' if is_call_request else 'Message'}",
-        "",
-    ]
-    if content_text:
-        summary_lines.append(f"Text: {content_text}")
-    if content_photo:
-        summary_lines.append("Photo attached")
-    if content_voice:
-        summary_lines.append("Voice message attached")
-
-    summary = "\n".join(summary_lines).strip()
+    driver_name = teleuser.first_name or teleuser.nickname or str(teleuser.telegram_id)
+    truck_number = teleuser.truck_number or "N/A"
+    summary = f"📨 From: {driver_name} ({truck_number})\nCategory: {category.name}"
 
     try:
         await bot.send_message(int(manager_group_id), summary, message_thread_id=topic_id)
@@ -307,7 +283,7 @@ async def send_to_manager_topic(
             message_thread_id=topic_id,
         )
     except Exception as exc:
-        logger.error("Failed to send message to manager group %s: %s", manager_group_id, exc)
+        logger.error("Failed to forward message to topic %s: %s", topic_id, exc)
         await message.answer("❌ Failed to deliver your message to managers.")
         return None
 
@@ -327,10 +303,12 @@ async def send_to_manager_topic(
         content_voice=voice_b64,
         driver_group_id=teleuser.driver_group_id,
         manager_group_id=teleuser.manager_group_id,
-        category_name=category_name,
+        category_name=category.name,
     )
 
+    await message.answer("✅ Your message has been sent to managers.")
     return topic_id
+
 
 # ---------------------------
 #  Group messages handler
@@ -541,17 +519,14 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
         return
 
     company = teleuser.company
-    if not company:
-        await message.answer("Your account is not linked to a company. Please contact an administrator.")
-        return
 
     if cat_name:
-        category = await get_category_for_company_async(cat_name, company.id)
+        category = await get_category_for_company_async(cat_name, company.id if company else None)
         if not category:
             await message.answer("Selected category is not available. Please choose another one.")
             return
     else:
-        category = await get_or_create_category_for_company_async(company.id, DEFAULT_GENERAL_CATEGORY_NAME)
+        category = await get_or_create_category_for_company_async(company.id if company else None, DEFAULT_GENERAL_CATEGORY_NAME)
 
     category_name = category.name if category else DEFAULT_GENERAL_CATEGORY_NAME
     topic_id = await send_to_manager_topic(
@@ -561,8 +536,6 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
         content_photo=content_photo,
         content_voice=content_voice,
         message=message,
-        category=category,
-        is_call_request=is_call_me,
     )
     if topic_id is None:
         return
@@ -574,13 +547,11 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
         content_text or "",
         content_photo or "",
         content_voice or "",
-        company_id=company.id,
-        responsible_id=str(teleuser.manager_group_id),
+        company_id=company.id if company else None,
+        responsible_id=str(teleuser.manager_group_id) if teleuser.manager_group_id is not None else "",
         mention_id=str(topic_id)
     )
 
-    action = "call request" if is_call_me else "message"
-    await message.answer(f"Your {action} has been saved and sent to specialists. Thank you!")
     user_state[user_id] = STATE_NONE
 
     updated_user = await get_teleuser_by_id(user_id)
@@ -817,8 +788,8 @@ async def handle_message(message: types.Message):
             user_state[user_id] = STATE_NONE
             return
         await create_timeoff(teleuser.id, df, dt, reason, pause_val)
-        company = teleuser.company
-        if not company or not company.manager_group_id:
+        manager_group_id = teleuser.manager_group_id
+        if not manager_group_id:
             await message.answer("Manager group is not configured. Please contact an administrator.")
             user_state[user_id] = STATE_NONE
             return
@@ -835,34 +806,43 @@ async def handle_message(message: types.Message):
             f"Pause Insurance/ELD: {pause_text}"
         )
 
-        category = await get_category_for_company_async("Safety", company.id)
+        company = teleuser.company
+        category = await get_category_for_company_async("Safety", company.id if company else None)
         if not category:
-            category = await get_or_create_category_for_company_async(company.id, "Safety")
-
-        topic_id = await ensure_category_topic(category, company)
-        if topic_id is None:
-            await message.answer("Failed to access the discussion topic for Safety category.")
+            category = await get_or_create_category_for_company_async(company.id if company else None, "Safety")
+        if not category:
+            await message.answer("Safety category is not available. Please contact an administrator.")
             user_state[user_id] = STATE_NONE
             return
 
+        topic_record = await get_topic_map_async(teleuser.id, category.id)
+        if topic_record:
+            topic_id = topic_record.topic_id
+        else:
+            try:
+                new_topic = await bot.create_forum_topic(int(manager_group_id), name=category.name)
+            except Exception as exc:
+                logger.error("Failed to create time-off topic for user %s: %s", teleuser.id, exc)
+                await message.answer("Failed to send to specialists. Please try again later.")
+                user_state[user_id] = STATE_NONE
+                return
+            topic_id = new_topic.message_thread_id
+            await create_topic_map_async(teleuser, category, topic_id)
+
         try:
-            await bot.send_message(
-                int(company.manager_group_id),
-                text=forward_text,
-                message_thread_id=topic_id
-            )
+            await bot.send_message(int(manager_group_id), text=forward_text, message_thread_id=topic_id)
         except Exception as e:
             logger.error("Failed to send time-off request to managers: %s", e)
             await message.answer(f"Failed to send to specialists: {e}")
             return
 
-        from_group = company.driver_group_id if company.driver_group_id is not None else message.chat.id
+        from_group = teleuser.driver_group_id if teleuser.driver_group_id is not None else message.chat.id
         await create_message_log_entry_async(
             teleuser=teleuser,
             company=company,
             category=category,
             from_group_id=from_group,
-            to_group_id=int(company.manager_group_id),
+            to_group_id=int(manager_group_id),
             topic_id=topic_id,
             content_text=forward_text,
             content_photo=None,
@@ -874,7 +854,7 @@ async def handle_message(message: types.Message):
         temp_user_data[user_id] = {}
         kb = ReplyKeyboardMarkup(resize_keyboard=True)
         kb.add("Request Time Off")
-        questions = await get_questions_for_category_async("Safety", company_id=company.id)
+        questions = await get_questions_for_category_async("Safety", company_id=company.id if company else None)
         for q in questions:
             kb.add(q.question)
         kb.add("Ask your questions")

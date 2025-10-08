@@ -36,7 +36,7 @@ class TeleUser(models.Model):
 
 class TopicMap(models.Model):
     teleuser = models.ForeignKey(TeleUser, on_delete=models.CASCADE)
-    category = models.CharField(max_length=100)
+    category = models.ForeignKey('Category', on_delete=models.CASCADE)
     topic_id = models.BigIntegerField()
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -62,14 +62,15 @@ class CompanyBoundQuerySet(models.QuerySet):
 
 
 class Category(models.Model):
-    name = models.CharField(max_length=200, unique=True)
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True, null=True)
     responsible_topic_id = models.CharField(
         max_length=50,
         blank=True,
         null=True,
         help_text="Укажите ID топика (message_thread_id) в форуме"
     )
-    company = models.ForeignKey(Company, on_delete=models.CASCADE)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, null=True, blank=True)
 
     objects = CompanyBoundQuerySet.as_manager()
 
