@@ -1,10 +1,11 @@
 from django.db import models
 from django.utils import timezone
 
-# Create your models here.
+
 class Company(models.Model):
-    name = models.CharField(max_length=200, unique=True, blank=True)
-    chat_id = models.CharField(max_length=100, blank=True, null=True)
+    name = models.CharField(max_length=200)
+    manager_group_id = models.BigIntegerField(null=True, blank=True)
+    driver_group_id = models.BigIntegerField(null=True, blank=True)
 
     def __str__(self):
         return self.name
@@ -16,23 +17,6 @@ class TeleUser(models.Model):
     nickname = models.CharField(max_length=100, blank=True, null=True)
     truck_number = models.CharField(max_length=100, blank=True, null=True)
     company = models.ForeignKey(Company, null=True, blank=True, on_delete=models.SET_NULL)
-
-    # Поля для хранения topic_id для каждой категории
-    accounting_topic_id = models.IntegerField(
-        blank=True,
-        null=True,
-        help_text="ID топика для Accounting"
-    )
-    safety_topic_id = models.IntegerField(
-        blank=True,
-        null=True,
-        help_text="ID топика для Safety"
-    )
-    operations_topic_id = models.IntegerField(
-        blank=True,
-        null=True,
-        help_text="ID топика для Operations"
-    )
 
     def __str__(self):
         return f"{self.first_name} ({self.nickname})"
@@ -50,22 +34,26 @@ class TimeOff(models.Model):
         return f"TimeOff {self.id} for {self.teleuser}"
 
 
+class CompanyBoundQuerySet(models.QuerySet):
+    def for_company(self, company: Company):
+        return self.filter(company=company)
+
+
 class Category(models.Model):
     name = models.CharField(max_length=200, unique=True)
-    responsible_chat = models.IntegerField(
-        blank=True,
-        null=True,
-        help_text="Укажите numeric chat_id или чата/группы для уведомлений"
-    )
     responsible_topic_id = models.CharField(
         max_length=50,
         blank=True,
         null=True,
         help_text="Укажите ID топика (message_thread_id) в форуме"
     )
+    company = models.ForeignKey(Company, on_delete=models.CASCADE)
+
+    objects = CompanyBoundQuerySet.as_manager()
 
     def __str__(self):
         return self.name
+
 
 class Question(models.Model):
     category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='questions')
@@ -74,9 +62,6 @@ class Question(models.Model):
 
     def __str__(self):
         return f"{self.question[:50]}..."
-
-
-
 
 
 class UserQuestion(models.Model):
@@ -104,3 +89,19 @@ class BotConfig(models.Model):
 
     def __str__(self):
         return f"BotConfig #{self.pk}"
+
+
+class MessageLog(models.Model):
+    teleuser = models.ForeignKey(TeleUser, on_delete=models.CASCADE)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE)
+    category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True)
+    from_group_id = models.BigIntegerField()
+    to_group_id = models.BigIntegerField()
+    topic_id = models.BigIntegerField(null=True, blank=True)
+    content_text = models.TextField(blank=True, null=True)
+    content_photo = models.TextField(blank=True, null=True)
+    content_voice = models.TextField(blank=True, null=True)
+    sent_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"MessageLog #{self.pk} from {self.teleuser}"
