@@ -36,7 +36,7 @@ import calendar
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = "7943795810:AAG0wun2bnwieW2K8Aefv9XHSXx2lFIJV8Y"
+TOKEN = "7628008847:AAExkl4-dWXo8etrnsR2LtipcxMKG7RR0JI"
 bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
