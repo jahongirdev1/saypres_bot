@@ -19,6 +19,7 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InputTextMessageContent,
 )
+from aiogram.utils.exceptions import BadRequest
 
 from main.models import (
     Category,
@@ -338,6 +339,94 @@ async def handle_bot_added_to_group(update: types.ChatMemberUpdated):
             text="Hello! I am a bot to assist drivers. Click the button below to start a private conversation with me. Please ask an administrator to pin this message to keep it accessible.",
             reply_markup=inline_kb
         )
+
+
+@dp.message_handler(commands=['run'])
+async def cmd_run(message: types.Message):
+    chat = message.chat
+    if chat.type != "supergroup" or not getattr(chat, "is_forum", False):
+        await message.reply("⚠️ This command must be used inside a supergroup with Topics enabled (forum mode).")
+        return
+
+    chat_id = chat.id
+    try:
+        categories = await sync_to_async(list)(Category.objects.all())
+    except Exception as exc:
+        logger.error("Failed to fetch categories for /run in chat %s: %s", chat_id, exc)
+        await message.answer(f"❌ Failed to load categories: {exc}")
+        return
+
+    if not categories:
+        await message.answer("⚠️ No categories found to create topics for.")
+        return
+
+    created_topics = []
+    skipped_topics = []
+    failed_topics = []
+
+    for category in categories:
+        try:
+            topic = await bot.create_forum_topic(chat_id=chat_id, name=category.name)
+        except BadRequest as exc:
+            error_text = str(exc)
+            if "ALREADY" in error_text.upper() or "EXIST" in error_text.upper():
+                skipped_topics.append(category.name)
+                logger.info(
+                    "Topic '%s' already exists in chat %s when processing /run: %s",
+                    category.name,
+                    chat_id,
+                    exc,
+                )
+            else:
+                failed_topics.append(category.name)
+                logger.error(
+                    "BadRequest while creating topic '%s' in chat %s: %s",
+                    category.name,
+                    chat_id,
+                    exc,
+                )
+        except Exception as exc:
+            failed_topics.append(category.name)
+            logger.error(
+                "Unexpected error while creating topic '%s' in chat %s: %s",
+                category.name,
+                chat_id,
+                exc,
+            )
+        else:
+            created_topics.append(category.name)
+            logger.info(
+                "Created forum topic '%s' (thread %s) in chat %s via /run",
+                category.name,
+                getattr(topic, "message_thread_id", "?"),
+                chat_id,
+            )
+
+    summary_lines = []
+    if created_topics:
+        summary_lines.append("✅ Topics created successfully:")
+        summary_lines.extend(f"- {name}" for name in created_topics)
+    if skipped_topics:
+        if summary_lines:
+            summary_lines.append("")
+        summary_lines.append("⚠️ Skipped existing topics:")
+        summary_lines.extend(f"- {name}" for name in skipped_topics)
+    if failed_topics:
+        if summary_lines:
+            summary_lines.append("")
+        summary_lines.append("❌ Failed to create topics:")
+        summary_lines.extend(f"- {name}" for name in failed_topics)
+
+    if not summary_lines:
+        summary_lines.append("⚠️ No topics were created or updated.")
+
+    await message.answer("\n".join(summary_lines))
+
+
+@dp.message_handler(commands=['get'])
+async def cmd_get(message: types.Message):
+    chat_id = message.chat.id
+    await message.answer(f"🆔 Group ID: <code>{chat_id}</code>")
 
 # ---------------------------
 #  Inline Mode handler
