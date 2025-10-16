@@ -316,6 +316,9 @@ async def send_to_manager_topic(
 # ---------------------------
 @dp.message_handler(lambda message: message.chat.type in ["group", "supergroup"])
 async def group_redirect(message: types.Message):
+    if message.text and message.text.startswith("/"):
+        return
+
     text = message.text or ""
     bot_username = (await bot.get_me()).username.lower()
     if f"@{bot_username}" in text.lower():
@@ -341,7 +344,7 @@ async def handle_bot_added_to_group(update: types.ChatMemberUpdated):
         )
 
 
-@dp.message_handler(commands=['run'])
+@dp.message_handler(commands=['run'], chat_type=['group', 'supergroup'])
 async def cmd_run(message: types.Message):
     chat = message.chat
     if chat.type != "supergroup" or not getattr(chat, "is_forum", False):
@@ -440,7 +443,7 @@ async def cmd_run(message: types.Message):
     await message.answer("\n".join(summary_lines))
 
 
-@dp.message_handler(commands=['get'])
+@dp.message_handler(commands=['get'], chat_type=['group', 'supergroup'])
 async def cmd_get(message: types.Message):
     chat_id = message.chat.id
     await message.answer(f"🆔 Group ID: {chat_id}")
@@ -1046,4 +1049,4 @@ async def handle_message(message: types.Message):
     await message.answer("Please choose a category or enter command /start.")
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    executor.start_polling(dp, skip_updates=False)
