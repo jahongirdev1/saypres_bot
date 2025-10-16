@@ -345,10 +345,27 @@ async def handle_bot_added_to_group(update: types.ChatMemberUpdated):
 async def cmd_run(message: types.Message):
     chat = message.chat
     if chat.type != "supergroup" or not getattr(chat, "is_forum", False):
-        await message.reply("⚠️ This command must be used inside a supergroup with Topics enabled (forum mode).")
+        await message.reply("⚠️ This command must be used inside a forum (supergroup with Topics enabled).")
         return
 
     chat_id = chat.id
+
+    try:
+        bot_user = await bot.get_me()
+        membership = await bot.get_chat_member(chat_id, bot_user.id)
+    except Exception as exc:
+        logger.error("Unable to check bot permissions for chat %s: %s", chat_id, exc)
+        await message.reply(f"⚠️ Failed to check bot permissions: {exc}")
+        return
+
+    can_manage_topics = False
+    if membership.status in ("creator", "administrator"):
+        can_manage_topics = membership.status == "creator" or bool(getattr(membership, "can_manage_topics", False))
+
+    if not can_manage_topics:
+        await message.reply("❌ Bot must be admin with “Manage Topics” permission.")
+        return
+
     try:
         categories = await sync_to_async(list)(Category.objects.all())
     except Exception as exc:
@@ -357,7 +374,7 @@ async def cmd_run(message: types.Message):
         return
 
     if not categories:
-        await message.answer("⚠️ No categories found to create topics for.")
+        await message.answer("⚠️ No categories found in database.")
         return
 
     created_topics = []
@@ -368,8 +385,8 @@ async def cmd_run(message: types.Message):
         try:
             topic = await bot.create_forum_topic(chat_id=chat_id, name=category.name)
         except BadRequest as exc:
-            error_text = str(exc)
-            if "ALREADY" in error_text.upper() or "EXIST" in error_text.upper():
+            error_text = str(exc).lower()
+            if any(keyword in error_text for keyword in ("exist", "already", "used")):
                 skipped_topics.append(category.name)
                 logger.info(
                     "Topic '%s' already exists in chat %s when processing /run: %s",
@@ -404,12 +421,12 @@ async def cmd_run(message: types.Message):
 
     summary_lines = []
     if created_topics:
-        summary_lines.append("✅ Topics created successfully:")
+        summary_lines.append("✅ Topics created:")
         summary_lines.extend(f"- {name}" for name in created_topics)
     if skipped_topics:
         if summary_lines:
             summary_lines.append("")
-        summary_lines.append("⚠️ Skipped existing topics:")
+        summary_lines.append("⚠️ Skipped (already exist):")
         summary_lines.extend(f"- {name}" for name in skipped_topics)
     if failed_topics:
         if summary_lines:
@@ -426,7 +443,7 @@ async def cmd_run(message: types.Message):
 @dp.message_handler(commands=['get'])
 async def cmd_get(message: types.Message):
     chat_id = message.chat.id
-    await message.answer(f"🆔 Group ID: <code>{chat_id}</code>")
+    await message.answer(f"🆔 Group ID: {chat_id}")
 
 # ---------------------------
 #  Inline Mode handler
