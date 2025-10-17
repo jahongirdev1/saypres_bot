@@ -1,5 +1,17 @@
 from django.contrib import admin
-from .models import Company, TeleUser, TimeOff, Category, Question, UserQuestion, BotConfig, MessageLog, TopicMap
+from .models import (
+    Company,
+    TeleUser,
+    TimeOff,
+    Category,
+    Question,
+    UserQuestion,
+    BotConfig,
+    MessageLog,
+    TopicMap,
+    ManagerGroup,
+    ManagerTopic,
+)
 
 admin.site.site_header = "Sayram Express LLC"
 admin.site.site_title = "Sayram Express LLC Admin Page"
@@ -67,3 +79,18 @@ class MessageLogAdmin(admin.ModelAdmin):
 class TopicMapAdmin(admin.ModelAdmin):
     list_display = ('teleuser', 'category', 'topic_id', 'created_at')
     search_fields = ('teleuser__first_name', 'teleuser__nickname', 'teleuser__telegram_id', 'category__name')
+
+
+@admin.register(ManagerTopic)
+class ManagerTopicAdmin(admin.ModelAdmin):
+    list_display = ('category_name', 'thread_id', 'topic_name', 'created_at')
+    list_filter = ('category_name',)
+    search_fields = ('category_name', 'topic_name', 'thread_id')
+    raw_id_fields = ('category',)
+
+
+@admin.register(ManagerGroup)
+class ManagerGroupAdmin(admin.ModelAdmin):
+    list_display = ('group_id', 'created_at')
+    search_fields = ('group_id',)
+    filter_horizontal = ('topics',)

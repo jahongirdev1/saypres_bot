@@ -52,6 +52,12 @@ class StoredTopicInfo:
     def __init__(self, thread_id: Optional[int]):
         self.message_thread_id = thread_id
 
+    @property
+    def thread_id(self) -> Optional[int]:
+        """Alias to keep compatibility with helpers that expect ``thread_id`` attribute."""
+
+        return self.message_thread_id
+
 
 class StoredManagerTopicInfo:
     """Represents a topic stored for a specific manager group."""
@@ -666,16 +672,42 @@ async def send_to_manager_topic(
         await message.answer("❌ Topic does not exist. Please try again.")
         return None
 
-    topic = await find_existing_topic_for_category(int(manager_group_id), category)
-    if not topic:
-        await message.answer("❌ Topic does not exist. Please try again.")
-        return None
+    stored_topic = await get_topic_by_category(category.name, int(manager_group_id))
+    topic_id: Optional[int] = None
+    if stored_topic:
+        raw_thread_id = getattr(stored_topic, "thread_id", None) or getattr(
+            stored_topic, "message_thread_id", None
+        )
+        if raw_thread_id is not None:
+            try:
+                topic_id = int(raw_thread_id)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid stored thread id '%s' for manager group %s and category %s",
+                    raw_thread_id,
+                    manager_group_id,
+                    category.id,
+                )
 
-    topic_id = getattr(topic, "message_thread_id", None)
+    topic: Optional[types.ForumTopic] = None
     if topic_id is None:
-        logger.error("Forum topic returned without thread id for category %s", category.id)
-        await message.answer("❌ Failed to deliver your message to managers.")
-        return None
+        topic, _ = await ensure_category_topic(int(manager_group_id), category)
+        if topic:
+            raw_thread_id = getattr(topic, "message_thread_id", None)
+            if raw_thread_id is not None:
+                try:
+                    topic_id = int(raw_thread_id)
+                except (TypeError, ValueError):
+                    logger.error(
+                        "Forum topic returned invalid thread id %s for category %s in group %s",
+                        raw_thread_id,
+                        category.id,
+                        manager_group_id,
+                    )
+                    topic_id = None
+        if topic_id is None:
+            await message.answer("❌ Topic does not exist. Please try again.")
+            return None
 
     topic_record = await get_topic_map_async(teleuser.id, category.id)
     if not topic_record:
