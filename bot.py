@@ -41,6 +41,15 @@ import calendar
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+class StoredTopicInfo:
+    """Lightweight container to mimic Telegram forum topic attributes."""
+
+    __slots__ = ("message_thread_id",)
+
+    def __init__(self, thread_id: Optional[int]):
+        self.message_thread_id = thread_id
+
 TOKEN = "7640503340:AAFQTJquUcNYwBK4EVSFcErX52BhTjbWKAA"
 bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
@@ -259,6 +268,52 @@ def update_category_topic_link(category_id: int, thread_id: int) -> None:
         )
 
 
+@sync_to_async
+def get_topic_by_category(category_name: str, chat_id: int) -> Optional[StoredTopicInfo]:
+    """Fetch stored topic information for a category within a manager group."""
+
+    try:
+        category = Category.objects.get(name=category_name)
+    except Category.DoesNotExist:
+        return None
+
+    mapping = (
+        TopicMap.objects.filter(
+            teleuser__manager_group_id=chat_id,
+            category=category,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if mapping and mapping.topic_id:
+        try:
+            thread_id = int(mapping.topic_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid topic id '%s' stored in TopicMap %s for category %s",
+                mapping.topic_id,
+                mapping.id,
+                category.id,
+            )
+        else:
+            return StoredTopicInfo(thread_id)
+
+    stored_thread_id = category.responsible_topic_id
+    if stored_thread_id:
+        try:
+            thread_id = int(stored_thread_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid responsible topic id '%s' for category %s",
+                stored_thread_id,
+                category.id,
+            )
+        else:
+            return StoredTopicInfo(thread_id)
+
+    return None
+
+
 async def safe_get_forum_topic(
     chat_id: Union[int, str],
     *,
@@ -317,6 +372,24 @@ async def safe_get_forum_topic(
 
 
 async def find_existing_topic_for_category(chat_id: int, category: Category) -> Optional[types.ForumTopic]:
+    try:
+        topic = await bot.get_forum_topic(chat_id=chat_id, name=category.name)
+    except TypeError:
+        logger.debug("Bot.get_forum_topic does not support lookup by name; falling back")
+    except BadRequest as exc:
+        if "not found" not in str(exc).lower():
+            logger.error("Failed to lookup topic '%s' in chat %s: %s", category.name, chat_id, exc)
+        topic = None
+    except Exception as exc:
+        logger.error("Unexpected error while fetching topic '%s' in chat %s: %s", category.name, chat_id, exc)
+        topic = None
+    else:
+        if topic:
+            thread_id = getattr(topic, "message_thread_id", None)
+            if thread_id is not None:
+                await update_category_topic_link(category.id, thread_id)
+            return topic
+
     stored_thread_id = category.responsible_topic_id
     if stored_thread_id:
         try:
@@ -327,6 +400,13 @@ async def find_existing_topic_for_category(chat_id: int, category: Category) -> 
             topic = await safe_get_forum_topic(chat_id, message_thread_id=thread_id)
             if topic:
                 return topic
+
+    stored_mapping = await get_topic_by_category(category.name, chat_id)
+    if stored_mapping and stored_mapping.message_thread_id is not None:
+        topic = await safe_get_forum_topic(chat_id, message_thread_id=stored_mapping.message_thread_id)
+        if topic:
+            await update_category_topic_link(category.id, stored_mapping.message_thread_id)
+            return topic
 
     topic = await safe_get_forum_topic(chat_id, name=category.name)
     if topic:
@@ -594,13 +674,13 @@ async def cmd_run(message: types.Message):
 
     created_topics = []  # List[Tuple[str, str, Optional[int], int]]
     failed_topics = []   # List[Tuple[str, str]]
-    skipped_topics = []  # List[Tuple[str, Optional[int]]]
+    skipped_topics = []  # List[Tuple[str, Optional[int], str]]
 
     for category in categories:
         existing_topic = await find_existing_topic_for_category(chat_id, category)
         if existing_topic:
             thread_id = getattr(existing_topic, "message_thread_id", None)
-            skipped_topics.append((category.name, thread_id))
+            skipped_topics.append((category.name, thread_id, "Topic already exists"))
             logger.info(
                 "Topic '%s' already exists in chat %s with thread %s, skipping creation",
                 category.name,
@@ -655,11 +735,13 @@ async def cmd_run(message: types.Message):
     if skipped_topics:
         if summary_lines:
             summary_lines.append("")
-        summary_lines.append("⚠️ Skipped existing topics:")
-        for name, thread_id in skipped_topics:
+        summary_lines.append("⚠️ Skipped existing topics (reusing existing threads):")
+        for name, thread_id, reason in skipped_topics:
             details = f"- {name}"
             if thread_id is not None:
                 details += f" (thread {thread_id})"
+            if reason:
+                details += f" — {reason}"
             summary_lines.append(details)
     if failed_topics:
         if summary_lines:
