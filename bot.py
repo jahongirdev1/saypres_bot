@@ -307,7 +307,7 @@ def get_manager_topics_map_async(group_id: int) -> dict:
 
 @sync_to_async
 def fetch_manager_topic_async(group_id: int, category: Optional[Category], category_name: str) -> Optional[StoredManagerTopicInfo]:
-    qs = ManagerTopic.objects.filter(manager_groups__group_id=group_id)
+    qs = ManagerTopic.objects.filter(group__group_id=group_id)
     if category and category.id:
         topic = qs.filter(category_id=category.id).order_by("-created_at").first()
         if topic:
@@ -317,7 +317,7 @@ def fetch_manager_topic_async(group_id: int, category: Optional[Category], categ
                 category_name=topic.category_name,
             )
     topic = (
-        ManagerTopic.objects.filter(manager_groups__group_id=group_id, category_name=category_name)
+        ManagerTopic.objects.filter(group__group_id=group_id, category_name=category_name)
         .order_by("-created_at")
         .first()
     )
@@ -344,22 +344,23 @@ def store_manager_topic_async(
     defaults = {
         "topic_name": topic_name or category_name,
         "category": category,
+        "thread_id": thread_id,
     }
-    manager_topic, _ = ManagerTopic.objects.get_or_create(
+    manager_topic, created = ManagerTopic.objects.update_or_create(
+        group=group,
         category_name=category_name,
-        thread_id=thread_id,
         defaults=defaults,
     )
 
     updates = {}
+    if manager_topic.thread_id != thread_id:
+        updates["thread_id"] = thread_id
     if topic_name and manager_topic.topic_name != topic_name:
         updates["topic_name"] = topic_name
     if category and manager_topic.category_id != category.id:
         updates["category_id"] = category.id
     if updates:
         ManagerTopic.objects.filter(pk=manager_topic.pk).update(**updates)
-
-    group.topics.add(manager_topic)
 
     return StoredManagerTopicInfo(
         thread_id=thread_id,
@@ -378,13 +379,13 @@ def get_topic_by_category(category_name: str, chat_id: int) -> Optional[StoredTo
         return None
 
     manager_topic = (
-        ManagerTopic.objects.filter(manager_groups__group_id=chat_id, category=category)
+        ManagerTopic.objects.filter(group__group_id=chat_id, category=category)
         .order_by("-created_at")
         .first()
     )
     if not manager_topic:
         manager_topic = (
-            ManagerTopic.objects.filter(manager_groups__group_id=chat_id, category_name=category_name)
+            ManagerTopic.objects.filter(group__group_id=chat_id, category_name=category_name)
             .order_by("-created_at")
             .first()
         )
