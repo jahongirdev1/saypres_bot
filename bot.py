@@ -472,15 +472,65 @@ async def safe_get_forum_topic(
             logger.error("Unexpected error while fetching forum topic: %s", exc)
             return None
 
-    if name is not None:
+    request_payload: Dict[str, Union[int, str]] = {"chat_id": chat_id}
+
+    if message_thread_id is not None:
         try:
-            response = await bot.request("getForumTopic", {"chat_id": chat_id, "name": name})
-        except TypeError:
+            request_payload["message_thread_id"] = int(message_thread_id)
+        except (TypeError, ValueError):
+            logger.error(
+                "Invalid thread id '%s' supplied when requesting forum topic in chat %s",
+                message_thread_id,
+                chat_id,
+            )
             return None
+
+        try:
+            response = await bot.request("getForumTopic", request_payload)
         except BadRequest as exc:
             if "not found" in str(exc).lower():
                 return None
-            raise
+            logger.error(
+                "Failed to request getForumTopic by thread id %s in chat %s: %s",
+                message_thread_id,
+                chat_id,
+                exc,
+            )
+            return None
+        except Exception as exc:
+            logger.error(
+                "Unexpected error while requesting forum topic %s in chat %s: %s",
+                message_thread_id,
+                chat_id,
+                exc,
+            )
+            return None
+        else:
+            if isinstance(response, types.ForumTopic):
+                return response
+            try:
+                return types.ForumTopic.de_json(response, bot)
+            except Exception as exc:
+                logger.error("Unable to parse forum topic response: %s", exc)
+                return None
+
+    if name is not None:
+        request_payload_with_name = dict(request_payload)
+        request_payload_with_name.pop("message_thread_id", None)
+        request_payload_with_name["name"] = name
+
+        try:
+            response = await bot.request("getForumTopic", request_payload_with_name)
+        except BadRequest as exc:
+            if "not found" in str(exc).lower():
+                return None
+            logger.error(
+                "Failed to request getForumTopic by name '%s' in chat %s: %s",
+                name,
+                chat_id,
+                exc,
+            )
+            return None
         except Exception as exc:
             logger.error("Failed to request getForumTopic by name: %s", exc)
             return None
