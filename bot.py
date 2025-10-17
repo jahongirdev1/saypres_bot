@@ -7,7 +7,7 @@ django.setup()
 
 import logging
 import base64
-from typing import Optional
+from typing import Optional, Tuple
 from django.db.models import Q
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import (
@@ -434,72 +434,62 @@ async def cmd_run(message: types.Message):
         await message.answer("⚠️ No categories found in database.")
         return
 
-    created_topics = []  # List[Tuple[str, Optional[int]]]
-    skipped_topics = []  # List[Tuple[str, Optional[int], Optional[str]]]
+    async def create_topic_with_unique_name(
+        target_chat_id: int,
+        base_name: str,
+        max_attempts: int = 5,
+    ) -> Tuple[types.ForumTopic, str, int]:
+        """Create a forum topic ensuring uniqueness within the target chat."""
+
+        cleaned_name = base_name.strip() or "Topic"
+        for attempt in range(1, max_attempts + 1):
+            if attempt == 1:
+                topic_name = cleaned_name
+            else:
+                suffix = f" #{attempt}"
+                topic_name = f"{cleaned_name}{suffix}"
+
+            if len(topic_name) > 128:
+                topic_name = topic_name[:128]
+
+            try:
+                logger.info(
+                    "Creating topic attempt %s for '%s' in chat %s with name '%s'",
+                    attempt,
+                    base_name,
+                    target_chat_id,
+                    topic_name,
+                )
+                topic = await bot.create_forum_topic(chat_id=target_chat_id, name=topic_name)
+            except BadRequest as exc:
+                error_text = str(exc).lower()
+                if any(keyword in error_text for keyword in ("exist", "already", "used")) and attempt < max_attempts:
+                    logger.info(
+                        "Topic name '%s' already exists in chat %s; retrying with a unique suffix",
+                        topic_name,
+                        target_chat_id,
+                    )
+                    continue
+                raise
+            else:
+                return topic, topic_name, attempt
+
+        raise RuntimeError(f"Failed to create unique topic name for '{base_name}' in chat {target_chat_id}")
+
+    created_topics = []  # List[Tuple[str, str, Optional[int], int]]
     failed_topics = []   # List[Tuple[str, str]]
 
     for category in categories:
-        existing_thread_id = None
-        if getattr(category, "responsible_topic_id", None):
-            try:
-                existing_thread_id = int(category.responsible_topic_id)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Category %s has non-numeric topic id '%s'; will attempt to recreate",
-                    category.name,
-                    category.responsible_topic_id,
-                )
-            else:
-                topic_exists = False
-                if hasattr(bot, "get_forum_topic"):
-                    try:
-                        await bot.get_forum_topic(chat_id=chat_id, message_thread_id=existing_thread_id)
-                    except Exception as exc:
-                        logger.warning(
-                            "Stored topic id %s for category %s is invalid, will attempt recreation: %s",
-                            existing_thread_id,
-                            category.name,
-                            exc,
-                        )
-                    else:
-                        topic_exists = True
-                else:
-                    logger.debug(
-                        "Bot API client has no get_forum_topic method; assuming topic %s exists for category %s",
-                        existing_thread_id,
-                        category.name,
-                    )
-                    topic_exists = True
-
-                if topic_exists:
-                    logger.info(
-                        "Skipping topic creation for category %s; already linked to thread %s",
-                        category.name,
-                        existing_thread_id,
-                    )
-                    skipped_topics.append((category.name, existing_thread_id, "already linked"))
-                    continue
-
         try:
-            topic = await bot.create_forum_topic(chat_id=chat_id, name=category.name)
+            topic, topic_name, attempt_number = await create_topic_with_unique_name(chat_id, category.name)
         except BadRequest as exc:
-            error_text = str(exc).lower()
-            if any(keyword in error_text for keyword in ("exist", "already", "used")):
-                skipped_topics.append((category.name, None, "already exists"))
-                logger.info(
-                    "Topic '%s' already exists in chat %s when processing /run: %s",
-                    category.name,
-                    chat_id,
-                    exc,
-                )
-            else:
-                failed_topics.append((category.name, str(exc)))
-                logger.error(
-                    "BadRequest while creating topic '%s' in chat %s: %s",
-                    category.name,
-                    chat_id,
-                    exc,
-                )
+            failed_topics.append((category.name, str(exc)))
+            logger.error(
+                "BadRequest while creating topic '%s' in chat %s: %s",
+                category.name,
+                chat_id,
+                exc,
+            )
         except Exception as exc:
             failed_topics.append((category.name, str(exc)))
             logger.error(
@@ -510,36 +500,27 @@ async def cmd_run(message: types.Message):
             )
         else:
             thread_id = getattr(topic, "message_thread_id", None)
-            created_topics.append((category.name, thread_id))
+            created_topics.append((category.name, topic_name, thread_id, attempt_number))
             logger.info(
-                "Created forum topic '%s' (thread %s) in chat %s via /run",
+                "Created forum topic '%s' as '%s' (thread %s) in chat %s via /run",
                 category.name,
+                topic_name,
                 thread_id,
                 chat_id,
             )
 
-            if thread_id is not None:
-                await update_category_topic_link(category.id, thread_id)
-
     summary_lines = []
     if created_topics:
         summary_lines.append("✅ Topics created:")
-        summary_lines.extend(
-            f"- {name}" + (f" (thread {thread_id})" if thread_id is not None else "")
-            for name, thread_id in created_topics
-        )
-    if skipped_topics:
-        if summary_lines:
-            summary_lines.append("")
-        summary_lines.append("⚠️ Skipped topics:")
-        summary_lines.extend(
-            "- {name}{thread}{reason}".format(
-                name=name,
-                thread=f" (thread {thread_id})" if thread_id is not None else "",
-                reason=f" — {note}" if note else "",
-            )
-            for name, thread_id, note in skipped_topics
-        )
+        for base_name, actual_name, thread_id, attempt_number in created_topics:
+            parts = [f"- {base_name}"]
+            if actual_name != base_name:
+                parts.append(f"→ {actual_name}")
+            if thread_id is not None:
+                parts.append(f"(thread {thread_id})")
+            if attempt_number > 1:
+                parts.append("[renamed]")
+            summary_lines.append(" ".join(parts))
     if failed_topics:
         if summary_lines:
             summary_lines.append("")
