@@ -18,6 +18,9 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllGroupChats,
 )
 from aiogram.utils.exceptions import BadRequest
 
@@ -40,6 +43,22 @@ logger = logging.getLogger(__name__)
 TOKEN = "7640503340:AAFQTJquUcNYwBK4EVSFcErX52BhTjbWKAA"
 bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
+
+
+async def setup_commands(bot_instance: Bot) -> None:
+    """Register bot commands for both private and group chats."""
+    commands = [
+        BotCommand(command="run", description="create topics in manager group"),
+        BotCommand(command="get", description="show group id"),
+    ]
+
+    try:
+        await bot_instance.set_my_commands(commands, scope=BotCommandScopeDefault())
+        await bot_instance.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+    except Exception as exc:
+        logger.error("Failed to set bot commands: %s", exc)
+    else:
+        logger.info("Bot commands registered successfully")
 
 # ---------------------------
 #  States
@@ -316,6 +335,7 @@ async def send_to_manager_topic(
 # ---------------------------
 @dp.message_handler(lambda message: message.chat.type in ["group", "supergroup"])
 async def group_redirect(message: types.Message):
+    logger.debug("Received group message in chat %s", message.chat.id)
     if message.text and message.text.startswith("/"):
         return
 
@@ -346,6 +366,19 @@ async def handle_bot_added_to_group(update: types.ChatMemberUpdated):
 
 @dp.message_handler(commands=['run'], chat_type=['group', 'supergroup'])
 async def cmd_run(message: types.Message):
+    logger.info("/run command received in chat %s by user %s", message.chat.id, message.from_user.id)
+
+    try:
+        user_membership = await bot.get_chat_member(message.chat.id, message.from_user.id)
+    except Exception as exc:
+        logger.error("Failed to check user permissions for /run in chat %s: %s", message.chat.id, exc)
+        await message.reply("❌ Unable to verify your permissions. Please try again later.")
+        return
+
+    if user_membership.status not in ("creator", "administrator"):
+        await message.reply("❌ Only group administrators can use this command.")
+        return
+
     chat = message.chat
     if chat.type != "supergroup" or not getattr(chat, "is_forum", False):
         await message.reply("⚠️ This command must be used inside a forum (supergroup with Topics enabled).")
@@ -445,6 +478,7 @@ async def cmd_run(message: types.Message):
 
 @dp.message_handler(commands=['get'], chat_type=['group', 'supergroup'])
 async def cmd_get(message: types.Message):
+    logger.info("/get command received in chat %s", message.chat.id)
     chat_id = message.chat.id
     await message.answer(f"🆔 Group ID: {chat_id}")
 
@@ -1048,5 +1082,10 @@ async def handle_message(message: types.Message):
 
     await message.answer("Please choose a category or enter command /start.")
 
+async def on_startup(dispatcher: Dispatcher):
+    await setup_commands(dispatcher.bot)
+    logger.info("Startup tasks completed")
+
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=False)
+    executor.start_polling(dp, skip_updates=False, on_startup=on_startup)
