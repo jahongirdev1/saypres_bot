@@ -44,6 +44,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _normalize_topic_key(name: Optional[str]) -> Optional[str]:
+    """Return a normalized key for topic name comparisons."""
+
+    if not name:
+        return None
+    normalized = " ".join(str(name).split()).strip()
+    return normalized.casefold() if normalized else None
+
+
 class StoredTopicInfo:
     """Lightweight container to mimic Telegram forum topic attributes."""
 
@@ -300,8 +309,12 @@ def get_manager_topics_map_async(group_id: int) -> dict:
         )
         if topic.category_id and topic.category_id not in by_id:
             by_id[topic.category_id] = info
-        if topic.category_name and topic.category_name not in by_name:
-            by_name[topic.category_name] = info
+        normalized_name = _normalize_topic_key(topic.category_name)
+        if topic.category_name and normalized_name and normalized_name not in by_name:
+            by_name[normalized_name] = info
+        topic_name_key = _normalize_topic_key(topic.topic_name)
+        if topic.topic_name and topic_name_key and topic_name_key not in by_name:
+            by_name[topic_name_key] = info
     return {"by_name": by_name, "by_id": by_id}
 
 
@@ -316,8 +329,9 @@ def fetch_manager_topic_async(group_id: int, category: Optional[Category], categ
                 topic_name=topic.topic_name or topic.category_name,
                 category_name=topic.category_name,
             )
+    normalized_name = (category_name or "").strip()
     topic = (
-        ManagerTopic.objects.filter(group__group_id=group_id, category_name=category_name)
+        ManagerTopic.objects.filter(group__group_id=group_id, category_name__iexact=normalized_name)
         .order_by("-created_at")
         .first()
     )
@@ -339,10 +353,12 @@ def store_manager_topic_async(
     topic_name: Optional[str] = None,
 ) -> StoredManagerTopicInfo:
     group, _ = ManagerGroup.objects.get_or_create(group_id=group_id)
-    category_name = category.name if category else (topic_name or "Topic")
+    base_category_name = category.name if category else (topic_name or "Topic")
+    category_name = (base_category_name or "Topic").strip()
+    topic_title = (topic_name or category_name).strip()
     thread_id = int(thread_id)
     defaults = {
-        "topic_name": topic_name or category_name,
+        "topic_name": topic_title,
         "category": category,
         "thread_id": thread_id,
     }
@@ -355,8 +371,8 @@ def store_manager_topic_async(
     updates = {}
     if manager_topic.thread_id != thread_id:
         updates["thread_id"] = thread_id
-    if topic_name and manager_topic.topic_name != topic_name:
-        updates["topic_name"] = topic_name
+    if manager_topic.topic_name != topic_title:
+        updates["topic_name"] = topic_title
     if category and manager_topic.category_id != category.id:
         updates["category_id"] = category.id
     if updates:
@@ -364,7 +380,7 @@ def store_manager_topic_async(
 
     return StoredManagerTopicInfo(
         thread_id=thread_id,
-        topic_name=topic_name or category_name,
+        topic_name=topic_title,
         category_name=category_name,
     )
 
@@ -385,7 +401,7 @@ def get_topic_by_category(category_name: str, chat_id: int) -> Optional[StoredTo
     )
     if not manager_topic:
         manager_topic = (
-            ManagerTopic.objects.filter(group__group_id=chat_id, category_name=category_name)
+            ManagerTopic.objects.filter(group__group_id=chat_id, category_name__iexact=category_name.strip())
             .order_by("-created_at")
             .first()
         )
@@ -901,8 +917,9 @@ async def cmd_run(message: types.Message):
     existing_topics_by_thread: Dict[int, types.ForumTopic] = {}
     for forum_topic in existing_forum_topics:
         topic_name = getattr(forum_topic, "name", None)
-        if topic_name:
-            existing_topics_by_name[topic_name] = forum_topic
+        normalized_name = _normalize_topic_key(topic_name)
+        if topic_name and normalized_name:
+            existing_topics_by_name[normalized_name] = forum_topic
         thread_id_value = getattr(forum_topic, "message_thread_id", None)
         if thread_id_value is None:
             continue
@@ -924,7 +941,10 @@ async def cmd_run(message: types.Message):
     failed_topics: List[str] = []
 
     for category in categories:
-        stored_info = stored_by_id.get(category.id) or stored_by_name.get(category.name)
+        name_key = _normalize_topic_key(category.name)
+        stored_info = stored_by_id.get(category.id)
+        if not stored_info and name_key:
+            stored_info = stored_by_name.get(name_key)
 
         candidate_names: List[str] = []
         if stored_info:
@@ -939,7 +959,10 @@ async def cmd_run(message: types.Message):
 
         existing_topic: Optional[types.ForumTopic] = None
         for candidate_name in candidate_names:
-            existing_topic = existing_topics_by_name.get(candidate_name)
+            normalized_candidate = _normalize_topic_key(candidate_name)
+            if not normalized_candidate:
+                continue
+            existing_topic = existing_topics_by_name.get(normalized_candidate)
             if existing_topic:
                 break
 
@@ -956,16 +979,18 @@ async def cmd_run(message: types.Message):
                 existing_topic = await safe_get_forum_topic(chat_id, message_thread_id=thread_id_candidate)
                 if existing_topic:
                     resolved_name = getattr(existing_topic, "name", None)
-                    if resolved_name:
-                        existing_topics_by_name[resolved_name] = existing_topic
+                    normalized_resolved = _normalize_topic_key(resolved_name)
+                    if resolved_name and normalized_resolved:
+                        existing_topics_by_name[normalized_resolved] = existing_topic
                     existing_topics_by_thread[thread_id_candidate] = existing_topic
 
         if not existing_topic:
             existing_topic = await find_existing_topic_for_category(chat_id, category)
             if existing_topic:
                 resolved_name = getattr(existing_topic, "name", None)
-                if resolved_name:
-                    existing_topics_by_name[resolved_name] = existing_topic
+                normalized_resolved = _normalize_topic_key(resolved_name)
+                if resolved_name and normalized_resolved:
+                    existing_topics_by_name[normalized_resolved] = existing_topic
                 resolved_thread = getattr(existing_topic, "message_thread_id", None)
                 if resolved_thread is not None:
                     try:
@@ -984,13 +1009,15 @@ async def cmd_run(message: types.Message):
                     thread_id=thread_id_value,
                     topic_name=topic_name,
                 )
-            if category.name not in existing_topics_by_name and topic_name:
-                existing_topics_by_name[category.name] = existing_topic
+            if topic_name:
+                normalized_category = _normalize_topic_key(category.name)
+                if normalized_category and normalized_category not in existing_topics_by_name:
+                    existing_topics_by_name[normalized_category] = existing_topic
 
             details = [f"- {category.name}"]
             if thread_id_value is not None:
                 details.append(f"(thread {thread_id_value})")
-            details.append("(already exists in the group)")
+            details.append("(already exists in the group and database)")
             skipped_topics.append(" ".join(details))
             logger.info(
                 "Topic '%s' already exists in chat %s with thread %s; skipping creation",
@@ -1035,10 +1062,12 @@ async def cmd_run(message: types.Message):
                 existing_topics_by_thread[int(thread_id_value)] = forum_topic
             except (TypeError, ValueError):
                 pass
-        if topic_name:
-            existing_topics_by_name[topic_name] = forum_topic
-        if category.name not in existing_topics_by_name and topic_name:
-            existing_topics_by_name[category.name] = forum_topic
+        normalized_topic_name = _normalize_topic_key(topic_name)
+        if normalized_topic_name:
+            existing_topics_by_name[normalized_topic_name] = forum_topic
+        normalized_category = _normalize_topic_key(category.name)
+        if topic_name and normalized_category and normalized_category not in existing_topics_by_name:
+            existing_topics_by_name[normalized_category] = forum_topic
 
         created_entry = f"- {category.name}"
         if thread_id_value is not None:
