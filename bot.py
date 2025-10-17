@@ -23,6 +23,7 @@ from aiogram.types import (
     BotCommandScopeAllGroupChats,
 )
 from aiogram.utils.exceptions import BadRequest
+from aiogram.dispatcher.handler import SkipHandler
 
 from main.models import (
     Category,
@@ -244,6 +245,19 @@ def create_topic_map_async(teleuser: TeleUser, category: Category, topic_id: int
         return None
 
 
+@sync_to_async
+def update_category_topic_link(category_id: int, thread_id: int) -> None:
+    try:
+        Category.objects.filter(pk=category_id).update(responsible_topic_id=str(thread_id))
+    except Exception as exc:
+        logger.error(
+            "Failed to persist topic link for category %s with thread %s: %s",
+            category_id,
+            thread_id,
+            exc,
+        )
+
+
 async def download_file_as_base64(file_id: str) -> Optional[str]:
     try:
         tg_file = await bot.get_file(file_id)
@@ -336,8 +350,9 @@ async def send_to_manager_topic(
 @dp.message_handler(lambda message: message.chat.type in ["group", "supergroup"])
 async def group_redirect(message: types.Message):
     logger.debug("Received group message in chat %s", message.chat.id)
-    if message.text and message.text.startswith("/"):
-        return
+    if message.is_command():
+        logger.debug("Skipping redirect handling for command %s in chat %s", message.text, message.chat.id)
+        raise SkipHandler()
 
     text = message.text or ""
     bot_username = (await bot.get_me()).username.lower()
@@ -379,12 +394,18 @@ async def cmd_run(message: types.Message):
         await message.reply("❌ Only group administrators can use this command.")
         return
 
-    chat = message.chat
-    if chat.type != "supergroup" or not getattr(chat, "is_forum", False):
-        await message.reply("⚠️ This command must be used inside a forum (supergroup with Topics enabled).")
+    chat_id = message.chat.id
+
+    try:
+        chat_info = await bot.get_chat(chat_id)
+    except Exception as exc:
+        logger.error("Failed to load chat info for %s: %s", chat_id, exc)
+        await message.reply(f"❌ Unable to load chat information: {exc}")
         return
 
-    chat_id = chat.id
+    if chat_info.type != "supergroup" or not getattr(chat_info, "is_forum", False):
+        await message.reply("⚠️ This command must be used inside a forum (supergroup with Topics enabled).")
+        return
 
     try:
         bot_user = await bot.get_me()
@@ -413,17 +434,58 @@ async def cmd_run(message: types.Message):
         await message.answer("⚠️ No categories found in database.")
         return
 
-    created_topics = []
-    skipped_topics = []
-    failed_topics = []
+    created_topics = []  # List[Tuple[str, Optional[int]]]
+    skipped_topics = []  # List[Tuple[str, Optional[int], Optional[str]]]
+    failed_topics = []   # List[Tuple[str, str]]
 
     for category in categories:
+        existing_thread_id = None
+        if getattr(category, "responsible_topic_id", None):
+            try:
+                existing_thread_id = int(category.responsible_topic_id)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Category %s has non-numeric topic id '%s'; will attempt to recreate",
+                    category.name,
+                    category.responsible_topic_id,
+                )
+            else:
+                topic_exists = False
+                if hasattr(bot, "get_forum_topic"):
+                    try:
+                        await bot.get_forum_topic(chat_id=chat_id, message_thread_id=existing_thread_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Stored topic id %s for category %s is invalid, will attempt recreation: %s",
+                            existing_thread_id,
+                            category.name,
+                            exc,
+                        )
+                    else:
+                        topic_exists = True
+                else:
+                    logger.debug(
+                        "Bot API client has no get_forum_topic method; assuming topic %s exists for category %s",
+                        existing_thread_id,
+                        category.name,
+                    )
+                    topic_exists = True
+
+                if topic_exists:
+                    logger.info(
+                        "Skipping topic creation for category %s; already linked to thread %s",
+                        category.name,
+                        existing_thread_id,
+                    )
+                    skipped_topics.append((category.name, existing_thread_id, "already linked"))
+                    continue
+
         try:
             topic = await bot.create_forum_topic(chat_id=chat_id, name=category.name)
         except BadRequest as exc:
             error_text = str(exc).lower()
             if any(keyword in error_text for keyword in ("exist", "already", "used")):
-                skipped_topics.append(category.name)
+                skipped_topics.append((category.name, None, "already exists"))
                 logger.info(
                     "Topic '%s' already exists in chat %s when processing /run: %s",
                     category.name,
@@ -431,7 +493,7 @@ async def cmd_run(message: types.Message):
                     exc,
                 )
             else:
-                failed_topics.append(category.name)
+                failed_topics.append((category.name, str(exc)))
                 logger.error(
                     "BadRequest while creating topic '%s' in chat %s: %s",
                     category.name,
@@ -439,7 +501,7 @@ async def cmd_run(message: types.Message):
                     exc,
                 )
         except Exception as exc:
-            failed_topics.append(category.name)
+            failed_topics.append((category.name, str(exc)))
             logger.error(
                 "Unexpected error while creating topic '%s' in chat %s: %s",
                 category.name,
@@ -447,28 +509,45 @@ async def cmd_run(message: types.Message):
                 exc,
             )
         else:
-            created_topics.append(category.name)
+            thread_id = getattr(topic, "message_thread_id", None)
+            created_topics.append((category.name, thread_id))
             logger.info(
                 "Created forum topic '%s' (thread %s) in chat %s via /run",
                 category.name,
-                getattr(topic, "message_thread_id", "?"),
+                thread_id,
                 chat_id,
             )
+
+            if thread_id is not None:
+                await update_category_topic_link(category.id, thread_id)
 
     summary_lines = []
     if created_topics:
         summary_lines.append("✅ Topics created:")
-        summary_lines.extend(f"- {name}" for name in created_topics)
+        summary_lines.extend(
+            f"- {name}" + (f" (thread {thread_id})" if thread_id is not None else "")
+            for name, thread_id in created_topics
+        )
     if skipped_topics:
         if summary_lines:
             summary_lines.append("")
-        summary_lines.append("⚠️ Skipped (already exist):")
-        summary_lines.extend(f"- {name}" for name in skipped_topics)
+        summary_lines.append("⚠️ Skipped topics:")
+        summary_lines.extend(
+            "- {name}{thread}{reason}".format(
+                name=name,
+                thread=f" (thread {thread_id})" if thread_id is not None else "",
+                reason=f" — {note}" if note else "",
+            )
+            for name, thread_id, note in skipped_topics
+        )
     if failed_topics:
         if summary_lines:
             summary_lines.append("")
         summary_lines.append("❌ Failed to create topics:")
-        summary_lines.extend(f"- {name}" for name in failed_topics)
+        summary_lines.extend(
+            f"- {name}" + (f" — {reason}" if reason else "")
+            for name, reason in failed_topics
+        )
 
     if not summary_lines:
         summary_lines.append("⚠️ No topics were created or updated.")
