@@ -133,7 +133,20 @@ class MessageLog(models.Model):
         return f"MessageLog #{self.pk} from {self.teleuser}"
 
 
+class ManagerGroup(models.Model):
+    group_id = models.BigIntegerField(unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"ManagerGroup {self.group_id}"
+
+
 class ManagerTopic(models.Model):
+    group = models.ForeignKey(
+        ManagerGroup,
+        on_delete=models.CASCADE,
+        related_name="topics",
+    )
     category = models.ForeignKey(
         Category,
         on_delete=models.SET_NULL,
@@ -147,17 +160,11 @@ class ManagerTopic(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = ("category_name", "thread_id")
+        unique_together = (
+            ("group", "category_name"),
+            ("group", "thread_id"),
+        )
 
     def __str__(self):
         display_name = self.topic_name or self.category_name or "Topic"
         return f"{display_name} ({self.thread_id})"
-
-
-class ManagerGroup(models.Model):
-    group_id = models.BigIntegerField(unique=True)
-    topics = models.ManyToManyField(ManagerTopic, related_name="manager_groups", blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return f"ManagerGroup {self.group_id}"
