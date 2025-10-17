@@ -34,6 +34,8 @@ from main.models import (
     TimeOff,
     MessageLog,
     TopicMap,
+    ManagerGroup,
+    ManagerTopic,
 )
 from datetime import datetime, date
 import calendar
@@ -49,6 +51,17 @@ class StoredTopicInfo:
 
     def __init__(self, thread_id: Optional[int]):
         self.message_thread_id = thread_id
+
+
+class StoredManagerTopicInfo:
+    """Represents a topic stored for a specific manager group."""
+
+    __slots__ = ("thread_id", "topic_name", "category_name")
+
+    def __init__(self, thread_id: int, topic_name: str, category_name: str):
+        self.thread_id = int(thread_id)
+        self.topic_name = topic_name
+        self.category_name = category_name
 
 TOKEN = "7640503340:AAFQTJquUcNYwBK4EVSFcErX52BhTjbWKAA"
 bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
@@ -269,6 +282,87 @@ def update_category_topic_link(category_id: int, thread_id: int) -> None:
 
 
 @sync_to_async
+def get_manager_topics_map_async(group_id: int) -> dict:
+    group, _ = ManagerGroup.objects.get_or_create(group_id=group_id)
+    by_name = {}
+    by_id = {}
+    for topic in group.topics.all().order_by("-created_at"):
+        info = StoredManagerTopicInfo(
+            thread_id=topic.thread_id,
+            topic_name=topic.topic_name or topic.category_name,
+            category_name=topic.category_name,
+        )
+        if topic.category_id and topic.category_id not in by_id:
+            by_id[topic.category_id] = info
+        if topic.category_name and topic.category_name not in by_name:
+            by_name[topic.category_name] = info
+    return {"by_name": by_name, "by_id": by_id}
+
+
+@sync_to_async
+def fetch_manager_topic_async(group_id: int, category: Optional[Category], category_name: str) -> Optional[StoredManagerTopicInfo]:
+    qs = ManagerTopic.objects.filter(manager_groups__group_id=group_id)
+    if category and category.id:
+        topic = qs.filter(category_id=category.id).order_by("-created_at").first()
+        if topic:
+            return StoredManagerTopicInfo(
+                thread_id=topic.thread_id,
+                topic_name=topic.topic_name or topic.category_name,
+                category_name=topic.category_name,
+            )
+    topic = (
+        ManagerTopic.objects.filter(manager_groups__group_id=group_id, category_name=category_name)
+        .order_by("-created_at")
+        .first()
+    )
+    if topic:
+        return StoredManagerTopicInfo(
+            thread_id=topic.thread_id,
+            topic_name=topic.topic_name or topic.category_name,
+            category_name=topic.category_name,
+        )
+    return None
+
+
+@sync_to_async
+def store_manager_topic_async(
+    group_id: int,
+    *,
+    category: Optional[Category],
+    thread_id: int,
+    topic_name: Optional[str] = None,
+) -> StoredManagerTopicInfo:
+    group, _ = ManagerGroup.objects.get_or_create(group_id=group_id)
+    category_name = category.name if category else (topic_name or "Topic")
+    thread_id = int(thread_id)
+    defaults = {
+        "topic_name": topic_name or category_name,
+        "category": category,
+    }
+    manager_topic, _ = ManagerTopic.objects.get_or_create(
+        category_name=category_name,
+        thread_id=thread_id,
+        defaults=defaults,
+    )
+
+    updates = {}
+    if topic_name and manager_topic.topic_name != topic_name:
+        updates["topic_name"] = topic_name
+    if category and manager_topic.category_id != category.id:
+        updates["category_id"] = category.id
+    if updates:
+        ManagerTopic.objects.filter(pk=manager_topic.pk).update(**updates)
+
+    group.topics.add(manager_topic)
+
+    return StoredManagerTopicInfo(
+        thread_id=thread_id,
+        topic_name=topic_name or category_name,
+        category_name=category_name,
+    )
+
+
+@sync_to_async
 def get_topic_by_category(category_name: str, chat_id: int) -> Optional[StoredTopicInfo]:
     """Fetch stored topic information for a category within a manager group."""
 
@@ -276,6 +370,30 @@ def get_topic_by_category(category_name: str, chat_id: int) -> Optional[StoredTo
         category = Category.objects.get(name=category_name)
     except Category.DoesNotExist:
         return None
+
+    manager_topic = (
+        ManagerTopic.objects.filter(manager_groups__group_id=chat_id, category=category)
+        .order_by("-created_at")
+        .first()
+    )
+    if not manager_topic:
+        manager_topic = (
+            ManagerTopic.objects.filter(manager_groups__group_id=chat_id, category_name=category_name)
+            .order_by("-created_at")
+            .first()
+        )
+    if manager_topic and manager_topic.thread_id:
+        try:
+            thread_id = int(manager_topic.thread_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid thread id '%s' stored for manager group %s and category %s",
+                manager_topic.thread_id,
+                chat_id,
+                category.id,
+            )
+        else:
+            return StoredTopicInfo(thread_id)
 
     mapping = (
         TopicMap.objects.filter(
@@ -372,6 +490,26 @@ async def safe_get_forum_topic(
 
 
 async def find_existing_topic_for_category(chat_id: int, category: Category) -> Optional[types.ForumTopic]:
+    stored_topic = await fetch_manager_topic_async(chat_id, category, category.name)
+    if stored_topic:
+        topic: Optional[types.ForumTopic] = None
+        thread_id = getattr(stored_topic, "thread_id", None)
+        if thread_id is not None:
+            topic = await safe_get_forum_topic(chat_id, message_thread_id=thread_id)
+        if not topic and getattr(stored_topic, "topic_name", None):
+            topic = await safe_get_forum_topic(chat_id, name=stored_topic.topic_name)
+        if topic:
+            thread_id = getattr(topic, "message_thread_id", thread_id)
+            if thread_id is not None:
+                await update_category_topic_link(category.id, thread_id)
+                await store_manager_topic_async(
+                    chat_id,
+                    category=category,
+                    thread_id=thread_id,
+                    topic_name=getattr(topic, "name", None) or stored_topic.topic_name,
+                )
+            return topic
+
     try:
         topic = await bot.get_forum_topic(chat_id=chat_id, name=category.name)
     except TypeError:
@@ -388,6 +526,12 @@ async def find_existing_topic_for_category(chat_id: int, category: Category) -> 
             thread_id = getattr(topic, "message_thread_id", None)
             if thread_id is not None:
                 await update_category_topic_link(category.id, thread_id)
+                await store_manager_topic_async(
+                    chat_id,
+                    category=category,
+                    thread_id=thread_id,
+                    topic_name=getattr(topic, "name", None) or category.name,
+                )
             return topic
 
     stored_thread_id = category.responsible_topic_id
@@ -399,6 +543,12 @@ async def find_existing_topic_for_category(chat_id: int, category: Category) -> 
         else:
             topic = await safe_get_forum_topic(chat_id, message_thread_id=thread_id)
             if topic:
+                await store_manager_topic_async(
+                    chat_id,
+                    category=category,
+                    thread_id=thread_id,
+                    topic_name=getattr(topic, "name", None) or category.name,
+                )
                 return topic
 
     stored_mapping = await get_topic_by_category(category.name, chat_id)
@@ -406,6 +556,12 @@ async def find_existing_topic_for_category(chat_id: int, category: Category) -> 
         topic = await safe_get_forum_topic(chat_id, message_thread_id=stored_mapping.message_thread_id)
         if topic:
             await update_category_topic_link(category.id, stored_mapping.message_thread_id)
+            await store_manager_topic_async(
+                chat_id,
+                category=category,
+                thread_id=stored_mapping.message_thread_id,
+                topic_name=getattr(topic, "name", None) or category.name,
+            )
             return topic
 
     topic = await safe_get_forum_topic(chat_id, name=category.name)
@@ -413,6 +569,12 @@ async def find_existing_topic_for_category(chat_id: int, category: Category) -> 
         thread_id = getattr(topic, "message_thread_id", None)
         if thread_id is not None:
             await update_category_topic_link(category.id, thread_id)
+            await store_manager_topic_async(
+                chat_id,
+                category=category,
+                thread_id=thread_id,
+                topic_name=getattr(topic, "name", None) or category.name,
+            )
         return topic
 
     return None
@@ -438,6 +600,12 @@ async def ensure_category_topic(chat_id: int, category: Category) -> Tuple[Optio
                 thread_id = getattr(topic, "message_thread_id", None)
                 if thread_id is not None:
                     await update_category_topic_link(category.id, thread_id)
+                    await store_manager_topic_async(
+                        chat_id,
+                        category=category,
+                        thread_id=thread_id,
+                        topic_name=getattr(topic, "name", None) or category.name,
+                    )
                 return topic, False
         logger.error("Failed to create forum topic '%s' in chat %s: %s", category.name, chat_id, exc)
         return None, False
@@ -448,6 +616,12 @@ async def ensure_category_topic(chat_id: int, category: Category) -> Tuple[Optio
     thread_id = getattr(new_topic, "message_thread_id", None)
     if thread_id is not None:
         await update_category_topic_link(category.id, thread_id)
+        await store_manager_topic_async(
+            chat_id,
+            category=category,
+            thread_id=thread_id,
+            topic_name=getattr(new_topic, "name", None) or category.name,
+        )
 
     return new_topic, True
 
@@ -672,14 +846,43 @@ async def cmd_run(message: types.Message):
 
         raise RuntimeError(f"Failed to create unique topic name for '{base_name}' in chat {target_chat_id}")
 
+    stored_topics_map = await get_manager_topics_map_async(chat_id)
+    stored_by_id = stored_topics_map.get("by_id", {})
+    stored_by_name = stored_topics_map.get("by_name", {})
+
     created_topics = []  # List[Tuple[str, str, Optional[int], int]]
     failed_topics = []   # List[Tuple[str, str]]
     skipped_topics = []  # List[Tuple[str, Optional[int], str]]
 
     for category in categories:
-        existing_topic = await find_existing_topic_for_category(chat_id, category)
+        stored_info = stored_by_id.get(category.id) or stored_by_name.get(category.name)
+        existing_topic = None
+        thread_id = None
+        topic_name_hint = None
+
+        if stored_info:
+            thread_id = getattr(stored_info, "thread_id", None)
+            topic_name_hint = getattr(stored_info, "topic_name", None)
+            if thread_id is not None:
+                existing_topic = await safe_get_forum_topic(chat_id, message_thread_id=thread_id)
+            if not existing_topic and topic_name_hint:
+                existing_topic = await safe_get_forum_topic(chat_id, name=topic_name_hint)
+        if not existing_topic:
+            existing_topic = await find_existing_topic_for_category(chat_id, category)
+
         if existing_topic:
-            thread_id = getattr(existing_topic, "message_thread_id", None)
+            thread_id = getattr(existing_topic, "message_thread_id", thread_id)
+            actual_name = getattr(existing_topic, "name", None) or topic_name_hint or category.name
+            if thread_id is not None:
+                stored_info = await store_manager_topic_async(
+                    chat_id,
+                    category=category,
+                    thread_id=thread_id,
+                    topic_name=actual_name,
+                )
+                stored_by_id[category.id] = stored_info
+                stored_by_name[category.name] = stored_info
+                await update_category_topic_link(category.id, thread_id)
             skipped_topics.append((category.name, thread_id, "Topic already exists"))
             logger.info(
                 "Topic '%s' already exists in chat %s with thread %s, skipping creation",
@@ -711,6 +914,14 @@ async def cmd_run(message: types.Message):
             thread_id = getattr(topic, "message_thread_id", None)
             if thread_id is not None:
                 await update_category_topic_link(category.id, thread_id)
+                stored_info = await store_manager_topic_async(
+                    chat_id,
+                    category=category,
+                    thread_id=thread_id,
+                    topic_name=topic_name,
+                )
+                stored_by_id[category.id] = stored_info
+                stored_by_name[category.name] = stored_info
             created_topics.append((category.name, topic_name, thread_id, attempt_number))
             logger.info(
                 "Created forum topic '%s' as '%s' (thread %s) in chat %s via /run",
