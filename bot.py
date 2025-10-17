@@ -7,7 +7,7 @@ django.setup()
 
 import logging
 import base64
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from django.db.models import Q
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import (
@@ -235,11 +235,12 @@ def get_topic_map_async(teleuser_id: int, category_id: int):
 @sync_to_async
 def create_topic_map_async(teleuser: TeleUser, category: Category, topic_id: int):
     try:
-        return TopicMap.objects.create(
+        obj, _ = TopicMap.objects.update_or_create(
             teleuser=teleuser,
             category=category,
-            topic_id=topic_id,
+            defaults={"topic_id": topic_id},
         )
+        return obj
     except Exception as exc:
         logger.error("Failed to create topic map for %s (%s): %s", teleuser.id, category.name, exc)
         return None
@@ -256,6 +257,119 @@ def update_category_topic_link(category_id: int, thread_id: int) -> None:
             thread_id,
             exc,
         )
+
+
+async def safe_get_forum_topic(
+    chat_id: Union[int, str],
+    *,
+    message_thread_id: Optional[int] = None,
+    name: Optional[str] = None,
+) -> Optional[types.ForumTopic]:
+    """Safely fetch a forum topic by thread id or name."""
+
+    if message_thread_id is None and name is None:
+        raise ValueError("Either message_thread_id or name must be provided")
+
+    method = getattr(bot, "get_forum_topic", None)
+
+    if method:
+        kwargs = {"chat_id": chat_id}
+        if message_thread_id is not None:
+            kwargs["message_thread_id"] = message_thread_id
+        if name is not None:
+            kwargs["name"] = name
+
+        try:
+            return await method(**kwargs)
+        except TypeError:
+            logger.debug("Bot.get_forum_topic does not accept provided parameters")
+        except BadRequest as exc:
+            error_text = str(exc).lower()
+            if "not found" in error_text or ("topic" in error_text and "exist" in error_text):
+                return None
+            raise
+        except Exception as exc:
+            logger.error("Unexpected error while fetching forum topic: %s", exc)
+            return None
+
+    if name is not None:
+        try:
+            response = await bot.request("getForumTopic", {"chat_id": chat_id, "name": name})
+        except TypeError:
+            return None
+        except BadRequest as exc:
+            if "not found" in str(exc).lower():
+                return None
+            raise
+        except Exception as exc:
+            logger.error("Failed to request getForumTopic by name: %s", exc)
+            return None
+        else:
+            if isinstance(response, types.ForumTopic):
+                return response
+            try:
+                return types.ForumTopic.de_json(response, bot)
+            except Exception as exc:
+                logger.error("Unable to parse forum topic response: %s", exc)
+                return None
+
+    return None
+
+
+async def find_existing_topic_for_category(chat_id: int, category: Category) -> Optional[types.ForumTopic]:
+    stored_thread_id = category.responsible_topic_id
+    if stored_thread_id:
+        try:
+            thread_id = int(stored_thread_id)
+        except (TypeError, ValueError):
+            logger.warning("Invalid stored topic id '%s' for category %s", stored_thread_id, category.id)
+        else:
+            topic = await safe_get_forum_topic(chat_id, message_thread_id=thread_id)
+            if topic:
+                return topic
+
+    topic = await safe_get_forum_topic(chat_id, name=category.name)
+    if topic:
+        thread_id = getattr(topic, "message_thread_id", None)
+        if thread_id is not None:
+            await update_category_topic_link(category.id, thread_id)
+        return topic
+
+    return None
+
+
+async def ensure_category_topic(chat_id: int, category: Category) -> Tuple[Optional[types.ForumTopic], bool]:
+    existing_topic = await find_existing_topic_for_category(chat_id, category)
+    if existing_topic:
+        return existing_topic, False
+
+    try:
+        new_topic = await bot.create_forum_topic(chat_id=chat_id, name=category.name)
+    except BadRequest as exc:
+        error_text = str(exc).lower()
+        if "exist" in error_text or "already" in error_text:
+            logger.info(
+                "Topic '%s' already exists in chat %s while ensuring category; attempting to reuse",
+                category.name,
+                chat_id,
+            )
+            topic = await safe_get_forum_topic(chat_id, name=category.name)
+            if topic:
+                thread_id = getattr(topic, "message_thread_id", None)
+                if thread_id is not None:
+                    await update_category_topic_link(category.id, thread_id)
+                return topic, False
+        logger.error("Failed to create forum topic '%s' in chat %s: %s", category.name, chat_id, exc)
+        return None, False
+    except Exception as exc:
+        logger.error("Failed to create forum topic '%s' in chat %s: %s", category.name, chat_id, exc)
+        return None, False
+
+    thread_id = getattr(new_topic, "message_thread_id", None)
+    if thread_id is not None:
+        await update_category_topic_link(category.id, thread_id)
+
+    return new_topic, True
 
 
 async def download_file_as_base64(file_id: str) -> Optional[str]:
@@ -291,17 +405,19 @@ async def send_to_manager_topic(
     except Category.DoesNotExist:
         category = await sync_to_async(Category.objects.create)(name=category_name)
 
+    topic, _ = await ensure_category_topic(int(manager_group_id), category)
+    if not topic:
+        await message.answer("❌ Failed to deliver your message to managers.")
+        return None
+
+    topic_id = getattr(topic, "message_thread_id", None)
+    if topic_id is None:
+        logger.error("Forum topic returned without thread id for category %s", category.id)
+        await message.answer("❌ Failed to deliver your message to managers.")
+        return None
+
     topic_record = await get_topic_map_async(teleuser.id, category.id)
-    if topic_record:
-        topic_id = topic_record.topic_id
-    else:
-        try:
-            new_topic = await bot.create_forum_topic(int(manager_group_id), name=category.name)
-        except Exception as exc:
-            logger.error("Failed to create forum topic for user %s (%s): %s", teleuser.id, category.name, exc)
-            await message.answer("❌ Failed to deliver your message to managers.")
-            return None
-        topic_id = new_topic.message_thread_id
+    if not topic_record:
         await create_topic_map_async(teleuser, category, topic_id)
 
     driver_name = teleuser.first_name or teleuser.nickname or str(teleuser.telegram_id)
@@ -478,8 +594,21 @@ async def cmd_run(message: types.Message):
 
     created_topics = []  # List[Tuple[str, str, Optional[int], int]]
     failed_topics = []   # List[Tuple[str, str]]
+    skipped_topics = []  # List[Tuple[str, Optional[int]]]
 
     for category in categories:
+        existing_topic = await find_existing_topic_for_category(chat_id, category)
+        if existing_topic:
+            thread_id = getattr(existing_topic, "message_thread_id", None)
+            skipped_topics.append((category.name, thread_id))
+            logger.info(
+                "Topic '%s' already exists in chat %s with thread %s, skipping creation",
+                category.name,
+                chat_id,
+                thread_id,
+            )
+            continue
+
         try:
             topic, topic_name, attempt_number = await create_topic_with_unique_name(chat_id, category.name)
         except BadRequest as exc:
@@ -500,6 +629,8 @@ async def cmd_run(message: types.Message):
             )
         else:
             thread_id = getattr(topic, "message_thread_id", None)
+            if thread_id is not None:
+                await update_category_topic_link(category.id, thread_id)
             created_topics.append((category.name, topic_name, thread_id, attempt_number))
             logger.info(
                 "Created forum topic '%s' as '%s' (thread %s) in chat %s via /run",
@@ -521,6 +652,15 @@ async def cmd_run(message: types.Message):
             if attempt_number > 1:
                 parts.append("[renamed]")
             summary_lines.append(" ".join(parts))
+    if skipped_topics:
+        if summary_lines:
+            summary_lines.append("")
+        summary_lines.append("⚠️ Skipped existing topics:")
+        for name, thread_id in skipped_topics:
+            details = f"- {name}"
+            if thread_id is not None:
+                details += f" (thread {thread_id})"
+            summary_lines.append(details)
     if failed_topics:
         if summary_lines:
             summary_lines.append("")
@@ -1050,18 +1190,21 @@ async def handle_message(message: types.Message):
             user_state[user_id] = STATE_NONE
             return
 
+        topic, _ = await ensure_category_topic(int(manager_group_id), category)
+        if not topic:
+            await message.answer("Failed to send to specialists. Please try again later.")
+            user_state[user_id] = STATE_NONE
+            return
+
+        topic_id = getattr(topic, "message_thread_id", None)
+        if topic_id is None:
+            logger.error("Forum topic missing thread id for time-off category %s", category.id)
+            await message.answer("Failed to send to specialists. Please try again later.")
+            user_state[user_id] = STATE_NONE
+            return
+
         topic_record = await get_topic_map_async(teleuser.id, category.id)
-        if topic_record:
-            topic_id = topic_record.topic_id
-        else:
-            try:
-                new_topic = await bot.create_forum_topic(int(manager_group_id), name=category.name)
-            except Exception as exc:
-                logger.error("Failed to create time-off topic for user %s: %s", teleuser.id, exc)
-                await message.answer("Failed to send to specialists. Please try again later.")
-                user_state[user_id] = STATE_NONE
-                return
-            topic_id = new_topic.message_thread_id
+        if not topic_record:
             await create_topic_map_async(teleuser, category, topic_id)
 
         try:
