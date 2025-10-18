@@ -2,6 +2,12 @@ from django.db import models
 from django.utils import timezone
 
 
+def norm(s: str) -> str:
+    """Return a normalized key for case-insensitive name comparisons."""
+
+    return (s or "").strip().casefold()
+
+
 class Company(models.Model):
     name = models.CharField(max_length=200)
     manager_group_id = models.BigIntegerField(null=True, blank=True)
@@ -134,8 +140,12 @@ class MessageLog(models.Model):
 
 
 class ManagerGroup(models.Model):
-    group_id = models.BigIntegerField(unique=True)
+    group_id = models.BigIntegerField(unique=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Manager group"
+        verbose_name_plural = "Manager groups"
 
     def __str__(self):
         return f"ManagerGroup {self.group_id}"
@@ -155,16 +165,36 @@ class ManagerTopic(models.Model):
         related_name="manager_topics",
     )
     category_name = models.CharField(max_length=100)
-    topic_name = models.CharField(max_length=128, blank=True)
-    thread_id = models.BigIntegerField()
+    topic_name = models.CharField(max_length=100)
+    thread_id = models.BigIntegerField(db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = (
-            ("group", "category_name"),
-            ("group", "thread_id"),
-        )
+        unique_together = ("group", "category_name")
+        indexes = [
+            models.Index(fields=["group", "category_name"]),
+            models.Index(fields=["group", "topic_name"]),
+        ]
+        verbose_name = "Manager topic"
+        verbose_name_plural = "Manager topics"
 
     def __str__(self):
-        display_name = self.topic_name or self.category_name or "Topic"
-        return f"{display_name} ({self.thread_id})"
+        topic = self.topic_name or self.category_name
+        return f"{topic} [{self.group.group_id}]"
+
+    @staticmethod
+    def _normalize_display_name(value: str) -> str:
+        return (value or "").strip()
+
+    def save(self, *args, **kwargs):
+        self.category_name = self._normalize_display_name(self.category_name)
+        topic_name = self.topic_name or self.category_name
+        self.topic_name = self._normalize_display_name(topic_name)
+        if self.thread_id is not None:
+            self.thread_id = int(self.thread_id)
+        super().save(*args, **kwargs)
+
+    @property
+    def category_name_norm(self) -> str:
+        return norm(self.category_name)
+
