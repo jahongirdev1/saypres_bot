@@ -83,14 +83,13 @@ class TopicMapAdmin(admin.ModelAdmin):
 
 @admin.register(ManagerTopic)
 class ManagerTopicAdmin(admin.ModelAdmin):
-    list_display = ('category_name', 'thread_id', 'topic_name', 'created_at')
-    list_filter = ('category_name',)
-    search_fields = ('category_name', 'topic_name', 'thread_id')
-    raw_id_fields = ('category',)
+    list_display = ('group', 'category_name', 'topic_name', 'thread_id', 'created_at')
+    list_filter = ('group', 'category_name')
+    search_fields = ('category_name', 'topic_name', 'thread_id', 'group__group_id')
+    raw_id_fields = ('category', 'group')
 
 
 @admin.register(ManagerGroup)
 class ManagerGroupAdmin(admin.ModelAdmin):
     list_display = ('group_id', 'created_at')
     search_fields = ('group_id',)
-    filter_horizontal = ('topics',)
