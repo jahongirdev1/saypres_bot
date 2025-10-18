@@ -87,6 +87,7 @@ async def setup_commands(bot_instance: Bot) -> None:
     """Register bot commands for both private and group chats."""
     commands = [
         BotCommand(command="run", description="create topics in manager group"),
+        BotCommand(command="sync", description="synchronize topics without creating duplicates"),
         BotCommand(command="get", description="show group id"),
     ]
 
@@ -855,20 +856,21 @@ async def handle_bot_added_to_group(update: types.ChatMemberUpdated):
         )
 
 
-@dp.message_handler(commands=['run'], chat_type=['group', 'supergroup'])
-async def cmd_run(message: types.Message):
-    logger.info("/run command received in chat %s by user %s", message.chat.id, message.from_user.id)
+async def prepare_group_for_topic_sync(message: types.Message) -> Optional[Tuple[int, List[Category]]]:
+    """Validate permissions and fetch categories for topic synchronization."""
+
+    logger.info("Preparing topic synchronization in chat %s by user %s", message.chat.id, message.from_user.id)
 
     try:
         user_membership = await bot.get_chat_member(message.chat.id, message.from_user.id)
     except Exception as exc:
-        logger.error("Failed to check user permissions for /run in chat %s: %s", message.chat.id, exc)
+        logger.error("Failed to check user permissions in chat %s: %s", message.chat.id, exc)
         await message.reply("❌ Unable to verify your permissions. Please try again later.")
-        return
+        return None
 
     if user_membership.status not in ("creator", "administrator"):
         await message.reply("❌ Only group administrators can use this command.")
-        return
+        return None
 
     chat_id = message.chat.id
 
@@ -877,11 +879,11 @@ async def cmd_run(message: types.Message):
     except Exception as exc:
         logger.error("Failed to load chat info for %s: %s", chat_id, exc)
         await message.reply(f"❌ Unable to load chat information: {exc}")
-        return
+        return None
 
     if chat_info.type != "supergroup" or not getattr(chat_info, "is_forum", False):
         await message.reply("⚠️ This command must be used inside a forum (supergroup with Topics enabled).")
-        return
+        return None
 
     try:
         bot_user = await bot.get_me()
@@ -889,7 +891,7 @@ async def cmd_run(message: types.Message):
     except Exception as exc:
         logger.error("Unable to check bot permissions for chat %s: %s", chat_id, exc)
         await message.reply(f"⚠️ Failed to check bot permissions: {exc}")
-        return
+        return None
 
     can_manage_topics = False
     if membership.status in ("creator", "administrator"):
@@ -897,47 +899,113 @@ async def cmd_run(message: types.Message):
 
     if not can_manage_topics:
         await message.reply("❌ Bot must be admin with “Manage Topics” permission.")
-        return
+        return None
 
     try:
         categories = await sync_to_async(list)(Category.objects.all())
     except Exception as exc:
-        logger.error("Failed to fetch categories for /run in chat %s: %s", chat_id, exc)
+        logger.error("Failed to fetch categories for chat %s: %s", chat_id, exc)
         await message.answer(f"❌ Failed to load categories: {exc}")
-        return
+        return None
 
     if not categories:
         await message.answer("⚠️ No categories found in database.")
+        return None
+
+    return chat_id, categories
+
+
+def _cache_forum_topic(
+    forum_topic: Optional[types.ForumTopic],
+    *,
+    by_name: Dict[str, types.ForumTopic],
+    by_thread: Dict[int, types.ForumTopic],
+):
+    if not forum_topic:
         return
 
-    await sync_to_async(ManagerGroup.objects.get_or_create)(group_id=chat_id)
+    topic_name = getattr(forum_topic, "name", None)
+    normalized_name = _normalize_topic_key(topic_name)
+    if topic_name and normalized_name:
+        by_name[normalized_name] = forum_topic
+
+    thread_id_value = getattr(forum_topic, "message_thread_id", None)
+    if thread_id_value is None:
+        return
+
+    try:
+        by_thread[int(thread_id_value)] = forum_topic
+    except (TypeError, ValueError):
+        logger.debug("Unable to normalize thread id %s for caching", thread_id_value)
+
+
+def _update_stored_topic_caches(
+    *,
+    category: Category,
+    info: Optional[StoredManagerTopicInfo],
+    by_id: Dict[int, StoredManagerTopicInfo],
+    by_name: Dict[str, StoredManagerTopicInfo],
+    by_thread: Dict[int, StoredManagerTopicInfo],
+):
+    if not info:
+        return
+
+    if category.id:
+        by_id[category.id] = info
+
+    for value in (info.category_name, info.topic_name, category.name):
+        normalized = _normalize_topic_key(value)
+        if normalized:
+            by_name[normalized] = info
+
+    try:
+        by_thread[int(info.thread_id)] = info
+    except (TypeError, ValueError):
+        logger.debug("Unable to cache stored topic with invalid thread id %s", info.thread_id)
+
+
+async def synchronize_manager_topics(
+    chat_id: int,
+    *,
+    categories: List[Category],
+    create_missing: bool = True,
+) -> Dict[str, List[str]]:
+    """Synchronize manager topics between Telegram and the database."""
+
+    manager_group, _ = await sync_to_async(ManagerGroup.objects.get_or_create)(group_id=chat_id)
+
+    stored_topics = await sync_to_async(list)(manager_group.topics.all())
+    stored_by_id: Dict[int, StoredManagerTopicInfo] = {}
+    stored_by_name: Dict[str, StoredManagerTopicInfo] = {}
+    stored_by_thread: Dict[int, StoredManagerTopicInfo] = {}
+
+    for topic in stored_topics:
+        info = StoredManagerTopicInfo(
+            thread_id=topic.thread_id,
+            topic_name=topic.topic_name or topic.category_name,
+            category_name=topic.category_name,
+        )
+        if topic.category_id:
+            stored_by_id[topic.category_id] = info
+        for value in (topic.category_name, topic.topic_name):
+            normalized = _normalize_topic_key(value)
+            if normalized and normalized not in stored_by_name:
+                stored_by_name[normalized] = info
+        try:
+            stored_by_thread[int(topic.thread_id)] = info
+        except (TypeError, ValueError):
+            logger.debug("Skipping cached manager topic with invalid thread id %s", topic.thread_id)
 
     existing_forum_topics = await list_forum_topics(chat_id)
-    existing_topics_by_name: Dict[str, types.ForumTopic] = {}
-    existing_topics_by_thread: Dict[int, types.ForumTopic] = {}
+    existing_by_name: Dict[str, types.ForumTopic] = {}
+    existing_by_thread: Dict[int, types.ForumTopic] = {}
     for forum_topic in existing_forum_topics:
-        topic_name = getattr(forum_topic, "name", None)
-        normalized_name = _normalize_topic_key(topic_name)
-        if topic_name and normalized_name:
-            existing_topics_by_name[normalized_name] = forum_topic
-        thread_id_value = getattr(forum_topic, "message_thread_id", None)
-        if thread_id_value is None:
-            continue
-        try:
-            existing_topics_by_thread[int(thread_id_value)] = forum_topic
-        except (TypeError, ValueError):
-            logger.debug(
-                "Skipping stored forum topic with invalid thread id %s in chat %s",
-                thread_id_value,
-                chat_id,
-            )
-
-    stored_topics_map = await get_manager_topics_map_async(chat_id)
-    stored_by_id = stored_topics_map.get("by_id", {})
-    stored_by_name = stored_topics_map.get("by_name", {})
+        _cache_forum_topic(forum_topic, by_name=existing_by_name, by_thread=existing_by_thread)
 
     created_topics: List[str] = []
+    linked_topics: List[str] = []
     skipped_topics: List[str] = []
+    missing_topics: List[str] = []
     failed_topics: List[str] = []
 
     for category in categories:
@@ -946,84 +1014,95 @@ async def cmd_run(message: types.Message):
         if not stored_info and name_key:
             stored_info = stored_by_name.get(name_key)
 
-        candidate_names: List[str] = []
+        candidate_name_keys: List[str] = []
+        if name_key:
+            candidate_name_keys.append(name_key)
         if stored_info:
-            topic_name_hint = getattr(stored_info, "topic_name", None)
-            category_name_hint = getattr(stored_info, "category_name", None)
-            if topic_name_hint:
-                candidate_names.append(topic_name_hint)
-            if category_name_hint and category_name_hint not in candidate_names:
-                candidate_names.append(category_name_hint)
-        if category.name not in candidate_names:
-            candidate_names.append(category.name)
+            for value in (stored_info.topic_name, stored_info.category_name):
+                normalized = _normalize_topic_key(value)
+                if normalized and normalized not in candidate_name_keys:
+                    candidate_name_keys.append(normalized)
 
         existing_topic: Optional[types.ForumTopic] = None
-        for candidate_name in candidate_names:
-            normalized_candidate = _normalize_topic_key(candidate_name)
-            if not normalized_candidate:
-                continue
-            existing_topic = existing_topics_by_name.get(normalized_candidate)
+        for key in candidate_name_keys:
+            existing_topic = existing_by_name.get(key)
             if existing_topic:
                 break
 
-        thread_id_hint = getattr(stored_info, "thread_id", None) if stored_info else None
-        thread_id_candidate: Optional[int] = None
-        if thread_id_hint is not None:
+        thread_id_hint: Optional[int] = None
+        if stored_info and getattr(stored_info, "thread_id", None) is not None:
             try:
-                thread_id_candidate = int(thread_id_hint)
+                thread_id_hint = int(stored_info.thread_id)
             except (TypeError, ValueError):
-                thread_id_candidate = None
-        if not existing_topic and thread_id_candidate is not None:
-            existing_topic = existing_topics_by_thread.get(thread_id_candidate)
-            if not existing_topic:
-                existing_topic = await safe_get_forum_topic(chat_id, message_thread_id=thread_id_candidate)
-                if existing_topic:
-                    resolved_name = getattr(existing_topic, "name", None)
-                    normalized_resolved = _normalize_topic_key(resolved_name)
-                    if resolved_name and normalized_resolved:
-                        existing_topics_by_name[normalized_resolved] = existing_topic
-                    existing_topics_by_thread[thread_id_candidate] = existing_topic
+                logger.debug("Invalid thread hint '%s' for category %s", stored_info.thread_id, category.id)
+                thread_id_hint = None
 
-        if not existing_topic:
-            existing_topic = await find_existing_topic_for_category(chat_id, category)
-            if existing_topic:
-                resolved_name = getattr(existing_topic, "name", None)
-                normalized_resolved = _normalize_topic_key(resolved_name)
-                if resolved_name and normalized_resolved:
-                    existing_topics_by_name[normalized_resolved] = existing_topic
-                resolved_thread = getattr(existing_topic, "message_thread_id", None)
-                if resolved_thread is not None:
-                    try:
-                        existing_topics_by_thread[int(resolved_thread)] = existing_topic
-                    except (TypeError, ValueError):
-                        pass
+        if not existing_topic and thread_id_hint is not None:
+            existing_topic = existing_by_thread.get(thread_id_hint)
+            if not existing_topic:
+                existing_topic = await safe_get_forum_topic(chat_id, message_thread_id=thread_id_hint)
+                _cache_forum_topic(existing_topic, by_name=existing_by_name, by_thread=existing_by_thread)
+
+        if not existing_topic and category.responsible_topic_id:
+            try:
+                resolved_thread = int(category.responsible_topic_id)
+            except (TypeError, ValueError):
+                resolved_thread = None
+            else:
+                existing_topic = existing_by_thread.get(resolved_thread)
+                if not existing_topic:
+                    existing_topic = await safe_get_forum_topic(chat_id, message_thread_id=resolved_thread)
+                    _cache_forum_topic(existing_topic, by_name=existing_by_name, by_thread=existing_by_thread)
+
+        if not existing_topic and category.name:
+            existing_topic = await safe_get_forum_topic(chat_id, name=category.name)
+            _cache_forum_topic(existing_topic, by_name=existing_by_name, by_thread=existing_by_thread)
 
         if existing_topic:
+            had_stored_topic = stored_info is not None
             thread_id_value = getattr(existing_topic, "message_thread_id", None)
-            topic_name = getattr(existing_topic, "name", None) or category.name
+            topic_title = getattr(existing_topic, "name", None) or category.name
+
+            new_info: Optional[StoredManagerTopicInfo] = None
             if thread_id_value is not None:
                 await update_category_topic_link(category.id, thread_id_value)
-                await store_manager_topic_async(
+                new_info = await store_manager_topic_async(
                     chat_id,
                     category=category,
                     thread_id=thread_id_value,
-                    topic_name=topic_name,
+                    topic_name=topic_title,
                 )
-            if topic_name:
-                normalized_category = _normalize_topic_key(category.name)
-                if normalized_category and normalized_category not in existing_topics_by_name:
-                    existing_topics_by_name[normalized_category] = existing_topic
+                _update_stored_topic_caches(
+                    category=category,
+                    info=new_info,
+                    by_id=stored_by_id,
+                    by_name=stored_by_name,
+                    by_thread=stored_by_thread,
+                )
 
-            details = [f"- {category.name}"]
+            entry = f"- {category.name}"
             if thread_id_value is not None:
-                details.append(f"(thread {thread_id_value})")
-            details.append("(already exists in the group and database)")
-            skipped_topics.append(" ".join(details))
+                entry += f" (thread {thread_id_value})"
+
+            if had_stored_topic:
+                skipped_topics.append(f"{entry} (already exists)")
+            else:
+                linked_topics.append(f"{entry} (linked from Telegram)")
+
             logger.info(
                 "Topic '%s' already exists in chat %s with thread %s; skipping creation",
                 category.name,
                 chat_id,
                 thread_id_value,
+            )
+            continue
+
+        if not create_missing:
+            missing_topics.append(f"- {category.name} (missing in Telegram)")
+            logger.info(
+                "Category '%s' has no forum topic in chat %s during sync",
+                category.name,
+                chat_id,
             )
             continue
 
@@ -1049,45 +1128,80 @@ async def cmd_run(message: types.Message):
             continue
 
         thread_id_value = getattr(forum_topic, "message_thread_id", None)
-        topic_name = getattr(forum_topic, "name", None) or category.name
+        topic_title = getattr(forum_topic, "name", None) or category.name
+        _cache_forum_topic(forum_topic, by_name=existing_by_name, by_thread=existing_by_thread)
+
         if thread_id_value is not None:
             await update_category_topic_link(category.id, thread_id_value)
-            await store_manager_topic_async(
+            stored_info = await store_manager_topic_async(
                 chat_id,
                 category=category,
                 thread_id=thread_id_value,
-                topic_name=topic_name,
+                topic_name=topic_title,
             )
-            try:
-                existing_topics_by_thread[int(thread_id_value)] = forum_topic
-            except (TypeError, ValueError):
-                pass
-        normalized_topic_name = _normalize_topic_key(topic_name)
-        if normalized_topic_name:
-            existing_topics_by_name[normalized_topic_name] = forum_topic
-        normalized_category = _normalize_topic_key(category.name)
-        if topic_name and normalized_category and normalized_category not in existing_topics_by_name:
-            existing_topics_by_name[normalized_category] = forum_topic
+            _update_stored_topic_caches(
+                category=category,
+                info=stored_info,
+                by_id=stored_by_id,
+                by_name=stored_by_name,
+                by_thread=stored_by_thread,
+            )
 
-        created_entry = f"- {category.name}"
+        entry = f"- {category.name}"
         if thread_id_value is not None:
-            created_entry += f" (thread {thread_id_value})"
-        created_topics.append(created_entry)
+            entry += f" (thread {thread_id_value})"
+        created_topics.append(entry)
+
         logger.info(
-            "Created forum topic '%s' (thread %s) in chat %s via /run",
+            "Created forum topic '%s' (thread %s) in chat %s",
             category.name,
             thread_id_value,
             chat_id,
         )
 
+    return {
+        "created": created_topics,
+        "linked": linked_topics,
+        "skipped": skipped_topics,
+        "missing": missing_topics,
+        "failed": failed_topics,
+    }
+
+
+@dp.message_handler(commands=['run'], chat_type=['group', 'supergroup'])
+async def cmd_run(message: types.Message):
+    logger.info("/run command received in chat %s by user %s", message.chat.id, message.from_user.id)
+
+    preparation = await prepare_group_for_topic_sync(message)
+    if not preparation:
+        return
+
+    chat_id, categories = preparation
+
+    results = await synchronize_manager_topics(chat_id, categories=categories, create_missing=True)
+
+    created_topics = results["created"]
+    linked_topics = results["linked"]
+    skipped_topics = results["skipped"]
+    failed_topics = results["failed"]
+
+    if not created_topics and not linked_topics and not failed_topics:
+        await message.answer("⚙️ All topics are already created for this group.")
+        return
+
     result_lines: List[str] = []
     if created_topics:
         result_lines.append("✅ Topics created:")
         result_lines.extend(created_topics)
+    if linked_topics:
+        if result_lines:
+            result_lines.append("")
+        result_lines.append("🔗 Topics linked from Telegram:")
+        result_lines.extend(linked_topics)
     if skipped_topics:
         if result_lines:
             result_lines.append("")
-        result_lines.append("⚠️ Skipped topics:")
+        result_lines.append("⚠️ Skipped:")
         result_lines.extend(skipped_topics)
     if failed_topics:
         if result_lines:
@@ -1095,8 +1209,50 @@ async def cmd_run(message: types.Message):
         result_lines.append("❌ Failed to create topics:")
         result_lines.extend(failed_topics)
 
-    if not result_lines:
-        result_lines.append("⚠️ No topics were created or updated.")
+    await message.answer("\n".join(result_lines))
+
+
+@dp.message_handler(commands=['sync'], chat_type=['group', 'supergroup'])
+async def cmd_sync(message: types.Message):
+    logger.info("/sync command received in chat %s by user %s", message.chat.id, message.from_user.id)
+
+    preparation = await prepare_group_for_topic_sync(message)
+    if not preparation:
+        return
+
+    chat_id, categories = preparation
+
+    results = await synchronize_manager_topics(chat_id, categories=categories, create_missing=False)
+
+    created_topics = results["created"]
+    linked_topics = results["linked"]
+    skipped_topics = results["skipped"]
+    missing_topics = results["missing"]
+    failed_topics = results["failed"]
+
+    if not created_topics and not linked_topics and not missing_topics and not failed_topics:
+        await message.answer("⚙️ All topics are already created for this group.")
+        return
+
+    result_lines: List[str] = []
+    if linked_topics:
+        result_lines.append("🔗 Topics linked from Telegram:")
+        result_lines.extend(linked_topics)
+    if skipped_topics:
+        if result_lines:
+            result_lines.append("")
+        result_lines.append("⚠️ Skipped:")
+        result_lines.extend(skipped_topics)
+    if missing_topics:
+        if result_lines:
+            result_lines.append("")
+        result_lines.append("ℹ️ Topics missing in Telegram:")
+        result_lines.extend(missing_topics)
+    if failed_topics:
+        if result_lines:
+            result_lines.append("")
+        result_lines.append("❌ Failed actions:")
+        result_lines.extend(failed_topics)
 
     await message.answer("\n".join(result_lines))
 
