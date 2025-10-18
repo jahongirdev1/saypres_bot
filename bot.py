@@ -939,6 +939,37 @@ def _cache_forum_topic(
         logger.debug("Unable to normalize thread id %s for caching", thread_id_value)
 
 
+async def topic_exists_in_telegram(
+    chat_id: int,
+    topic_name: str,
+    *,
+    by_name_cache: Optional[Dict[str, types.ForumTopic]] = None,
+    by_thread_cache: Optional[Dict[int, types.ForumTopic]] = None,
+) -> Optional[types.ForumTopic]:
+    """Return an existing Telegram topic matching ``topic_name`` if present."""
+
+    normalized_key = _normalize_topic_key(topic_name)
+    if not normalized_key:
+        return None
+
+    name_cache = by_name_cache if by_name_cache is not None else {}
+    cached_topic = name_cache.get(normalized_key)
+    if cached_topic:
+        return cached_topic
+
+    topic = await safe_get_forum_topic(chat_id, name=topic_name)
+    _cache_forum_topic(
+        topic,
+        by_name=name_cache,
+        by_thread=by_thread_cache if by_thread_cache is not None else {},
+    )
+
+    if cached_topic := name_cache.get(normalized_key):
+        return cached_topic
+
+    return topic
+
+
 def _update_stored_topic_caches(
     *,
     category: Category,
@@ -1014,20 +1045,27 @@ async def synchronize_manager_topics(
         if not stored_info and name_key:
             stored_info = stored_by_name.get(name_key)
 
-        candidate_name_keys: List[str] = []
-        if name_key:
-            candidate_name_keys.append(name_key)
-        if stored_info:
-            for value in (stored_info.topic_name, stored_info.category_name):
-                normalized = _normalize_topic_key(value)
-                if normalized and normalized not in candidate_name_keys:
-                    candidate_name_keys.append(normalized)
-
         existing_topic: Optional[types.ForumTopic] = None
-        for key in candidate_name_keys:
-            existing_topic = existing_by_name.get(key)
-            if existing_topic:
-                break
+        if category.name:
+            existing_topic = await topic_exists_in_telegram(
+                chat_id,
+                category.name,
+                by_name_cache=existing_by_name,
+                by_thread_cache=existing_by_thread,
+            )
+
+        if not existing_topic and stored_info:
+            for candidate_name in (stored_info.topic_name, stored_info.category_name):
+                if not candidate_name:
+                    continue
+                existing_topic = await topic_exists_in_telegram(
+                    chat_id,
+                    candidate_name,
+                    by_name_cache=existing_by_name,
+                    by_thread_cache=existing_by_thread,
+                )
+                if existing_topic:
+                    break
 
         thread_id_hint: Optional[int] = None
         if stored_info and getattr(stored_info, "thread_id", None) is not None:
@@ -1053,10 +1091,6 @@ async def synchronize_manager_topics(
                 if not existing_topic:
                     existing_topic = await safe_get_forum_topic(chat_id, message_thread_id=resolved_thread)
                     _cache_forum_topic(existing_topic, by_name=existing_by_name, by_thread=existing_by_thread)
-
-        if not existing_topic and category.name:
-            existing_topic = await safe_get_forum_topic(chat_id, name=category.name)
-            _cache_forum_topic(existing_topic, by_name=existing_by_name, by_thread=existing_by_thread)
 
         if existing_topic:
             had_stored_topic = stored_info is not None
